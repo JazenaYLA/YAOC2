@@ -1,0 +1,39 @@
+# Environment files
+.env
+**/.env
+!**/.env.example
+
+# Secrets
+*.key
+*.pem
+*.cert
+*.crt
+secrets/
+
+# n8n exports with credentials
+lxc-n8nclaw/workflows/with-credentials/
+
+# Flowise exports with credentials
+lxc-flowise/chatflows/with-credentials/
+
+# Local overrides
+*.local
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+.tmp/
