@@ -1,29 +1,58 @@
 # YAOC2 – Yet Another OpenClaw Clone
 
-YAOC2 is a self‑hosted, **policy‑aware** OpenClaw‑style agent framework built on n8n, Flowise and Shuffle, designed for CTI and SOC homelabs running on Proxmox VE.
+YAOC2 is a self-hosted, **policy-aware** OpenClaw-style agent framework built on n8n, Flowise and Shuffle,
+designed for CTI and SOC homelabs running on Proxmox VE.
 
-Instead of a single monolithic agent that directly touches all your tools, YAOC2 separates the **brain** (reasoning, skills, memory) from the **hands** (execution, SOAR), with a NemoClaw‑style policy gateway in between.
+Instead of a single monolithic agent that directly touches all your tools, YAOC2 separates the
+**brain** (reasoning, skills, memory) from the **hands** (execution, SOAR), with a NemoClaw-style
+policy gateway in between.
 
-- **Brain**: n8n "OpenClaw clone" (fork of `n8n-claw`) with MCP‑style skills and memory.
-- **Gateway**: n8n policy engine that receives structured ProposedAction objects, enforces policies, and dispatches to sandboxed workflows or Shuffle.
-- **Execution**: thin n8n workflows and Shuffle playbooks that talk to MISP, OpenCTI, TheHive, XTM, etc., using your existing CTI stack.
+- **Brain**: YAOC2 brain workflows imported into your existing n8n LXC (set up via [n8n-ecosystem-unified](https://github.com/JazenaYLA/n8n-ecosystem-unified)).
+- **Gateway**: A lightweight Dockge stack (`yaoc2-gateway`) deployed inside the existing `lxc-dockge-cti`, sharing `cti-net` and `infra-postgres` with all other CTI services.
+- **Execution**: Sandbox workflows inside the gateway call MISP, OpenCTI, TheHive, Shuffle, XTM etc. directly over Docker network — zero inter-LXC hops.
+
+---
+
+## Prerequisites
+
+| Requirement | Repo |
+|---|---|
+| Proxmox VE CTI service stack | [threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack) |
+| n8n LXC (systemd, Postgres-backed) | [n8n-ecosystem-unified](https://github.com/JazenaYLA/n8n-ecosystem-unified) |
+| `infra-postgres` running `pgvector/pgvector:pg17` | threatlabs-cti-stack `infra/` stack |
 
 ---
 
 ## Architecture
 
-YAOC2 is designed for an environment where most CTI/SOC apps run as Proxmox LXC containers, and heavy multi‑service stacks (like XTM and Shuffle) run inside a dedicated `dockge-cti` LXC.
+```
+[User / Channel — Telegram, Discord, Web]
+        │
+        ▼
+┌────────────────────────────────┐
+│  lxc-n8n  (existing)           │  systemd n8n  :5678
+│  YAOC2 Brain workflows         │  set up by n8n-ecosystem-unified
+│  Memory → infra-postgres       │  NO direct access to CTI services
+└────────────────┬───────────────┘
+                 │  ProposedAction JSON  (HTTP POST)
+                 ▼
+┌────────────────────────────────────────────────────────┐
+│  lxc-dockge-cti  (existing)                            │
+│                                                        │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  yaoc2-gateway  Dockge stack  :5679              │  │
+│  │  n8n gateway + policy engine                    │  │
+│  │  audit log → infra-postgres (yaoc2 schema)      │  │
+│  └──────────────────────┬───────────────────────────┘  │
+│                         │  validated, policy-approved   │
+│                         ▼                               │
+│  infra-postgres · infra-valkey · cti-net               │
+│  misp · opencti · thehive · dfir-iris                  │
+│  xtm · shuffle · flowintel · lacus · ail               │
+└────────────────────────────────────────────────────────┘
+```
 
-| LXC | Role | n8n Instance | Outbound Access |
-|---|---|---|---|
-| `lxc-yaoc2-brain` | Reasoning, skills, memory | Instance A (port 5678) | Gateway only |
-| `lxc-yaoc2-gateway` | Policy engine + sandbox execution | Instance B (port 5679) | All CTI LXCs, dockge-cti |
-| `lxc-dockge-cti` | XTM, Shuffle (existing) | — | Internet, CTI LXCs |
-| CTI LXCs | MISP, OpenCTI, TheHive, Flowise (existing) | — | cti-net only |
-
-The only trust edge is: `n8n-brain → n8n-gateway → CTI services / Shuffle`.
-
-See [`docs/architecture.md`](docs/architecture.md) and [`docs/networking.md`](docs/networking.md) for full details.
+**Resource delta to add YAOC2:** ~400 MB RAM inside existing dockge-cti LXC. Zero new LXC containers.
 
 ---
 
@@ -43,15 +72,13 @@ yaoc2/
 
   infra/
     proxmox/
-      lxc-yaoc2-brain.conf.example
-      lxc-yaoc2-gateway.conf.example
-    docker/
-      n8n-brain/
-        docker-compose.yml
+      lxc-yaoc2-brain.conf.example   # reference only — brain reuses existing n8n LXC
+    dockge/
+      yaoc2-gateway/
+        docker-compose.yml           # drop into dockge-cti alongside other stacks
         .env.example
-      n8n-gateway/
-        docker-compose.yml
-        .env.example
+    migrations/
+      000_yaoc2_schema.sql           # run against infra-postgres
 
   n8n/
     brain/
@@ -65,6 +92,12 @@ yaoc2/
         yaoc2-sandbox-misp-enrich.json
         yaoc2-sandbox-opencti-sync.json
         yaoc2-sandbox-thehive-case.json
+      code/
+        validate-schema.js           # Code node — schema validation
+        evaluate-policy.js           # Code node — policy evaluation
+        build-proposed-action.js     # Code node — brain side
+        map-to-sandbox.js            # Code node — action → workflow dispatch
+        normalise-response.js        # Code node — result normalisation
 
   policies/
     policy-sets/
@@ -85,45 +118,34 @@ yaoc2/
 
 ---
 
-## ProposedAction Schema
-
-The brain never calls CTI tools directly. Instead it emits a structured ProposedAction JSON object and sends it to the gateway via Webhook or `Execute Workflow`.
-
-Core fields:
-
-- `id`, `timestamp`
-- `agent`: name, version, session_id
-- `requester`: user_id, display_name, channel, tenant
-- `intent`: title, description, user_prompt
-- `action`: type, name, target_system, mode, parameters
-- `risk`: level, reasons, estimated_impact
-- `constraints`: must_complete_before, max_cost_units, dry_run
-- `policy`: policy_set, required_approvals
-
-See `examples/proposed-action-misp-enrich.json` for a full example.
-
----
-
-## Policy Model
-
-Policies live as YAML files under `policies/policy-sets/` (or mirrored into Postgres). The gateway evaluates ProposedAction objects against these rules and decides: `allow`, `deny`, or `needs-approval`.
-
-See [`docs/policies.md`](docs/policies.md) for the full policy schema and rule examples.
-
----
-
 ## Quick Start
 
-1. **Create two LXC containers in Proxmox** — `lxc-yaoc2-brain` and `lxc-yaoc2-gateway`.
-2. **Clone this repo** into each LXC.
-3. **Copy and fill in `.env`** files — see `infra/docker/n8n-brain/.env.example` and `infra/docker/n8n-gateway/.env.example`.
-4. **Bring up n8n** in each LXC: `docker compose up -d`.
-5. **Import n8n workflows** from `n8n/brain/workflows/` into the brain instance, and `n8n/gateway/workflows/` into the gateway instance.
-6. **Configure credentials** for MISP, OpenCTI, TheHive, Shuffle, Flowise, XTM in the gateway n8n instance.
-7. **Set up firewall rules** so the brain can only reach the gateway, and the gateway can reach CTI LXCs and `dockge-cti`.
-8. **Connect a front‑end** (Telegram bot, Discord bot, etc.) to the brain's webhook.
+1. **Ensure prerequisites** — threatlabs-cti-stack running, n8n-ecosystem-unified installed.
+2. **Upgrade infra-postgres** to `pgvector/pgvector:pg17` (non-alpine) if not already done — see `infra/` notes below.
+3. **Run DB migration** on dockge-cti LXC:
+   ```bash
+   docker exec -i infra-postgres psql -U postgres < infra/migrations/000_yaoc2_schema.sql
+   ```
+4. **Deploy gateway Dockge stack** — copy `infra/dockge/yaoc2-gateway/` into dockge-cti LXC and add via Dockge UI.
+5. **Import brain workflows** — import `n8n/brain/workflows/yaoc2-brain-openclaw.json` into your existing n8n LXC.
+6. **Import gateway workflows** — import `n8n/gateway/workflows/*.json` into the gateway n8n instance.
+7. **Set credentials** — add MISP, OpenCTI, TheHive, Shuffle, Flowise, XTM, Telegram credentials in the gateway n8n.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full installation walkthrough.
+See `docs/architecture.md` for the full walkthrough.
+
+---
+
+## infra-postgres: Alpine → Full Image
+
+The `infra/` stack in threatlabs-cti-stack is being upgraded from `postgres:17-alpine` to
+`pgvector/pgvector:pg17` (full Debian-based image with pgvector extension).
+
+This gives YAOC2 (and n8n-ecosystem-unified) access to:
+- `pgvector` — vector similarity search for n8n AI memory nodes.
+- Full `pg_stat_statements`, logical replication, and extension support not available in Alpine builds.
+- Consistent behaviour with upstream PostgreSQL packages.
+
+See `infra/migrations/000_yaoc2_schema.sql` for the YAOC2-specific schema that runs on top of this.
 
 ---
 
@@ -133,7 +155,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full installation wal
 - [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) — inspiration for the policy gateway and sandbox execution model.
 - [openclaw/openclaw](https://github.com/openclaw/openclaw) — original OpenClaw agent framework.
 - [Shuffle SOAR](https://github.com/Shuffle/Shuffle) — SOAR execution layer.
-- [threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack) — the Proxmox CTI homelab this is designed to extend.
+- [threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack) — CTI platform this is designed to extend.
+- [n8n-ecosystem-unified](https://github.com/JazenaYLA/n8n-ecosystem-unified) — n8n platform layer (install, DB, Caddy, base workflows).
 
 ---
 

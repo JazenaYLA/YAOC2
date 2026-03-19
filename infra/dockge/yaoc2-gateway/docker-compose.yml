@@ -1,0 +1,73 @@
+# YAOC2 Gateway — Dockge stack
+# Deploy this inside lxc-dockge-cti alongside other CTI stacks.
+# Joins the existing cti-net Docker network — no new network needed.
+# Uses infra-postgres for audit log and policy storage — no separate DB container.
+
+services:
+  n8n-gateway:
+    image: n8nio/n8n:latest
+    container_name: yaoc2-gateway
+    restart: unless-stopped
+    ports:
+      - "5679:5678"
+    environment:
+      # --- Database (shared infra-postgres, pgvector/pgvector:pg17) ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: infra-postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: yaoc2
+      DB_POSTGRESDB_USER: yaoc2
+      DB_POSTGRESDB_PASSWORD: ${YAOC2_DB_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: n8n_gateway
+
+      # --- n8n core ---
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      WEBHOOK_URL: ${GATEWAY_WEBHOOK_URL}
+      GENERIC_TIMEZONE: America/Chicago
+      TZ: America/Chicago
+      N8N_LOG_LEVEL: info
+
+      # --- Security ---
+      GATEWAY_WEBHOOK_SECRET: ${GATEWAY_WEBHOOK_SECRET}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+
+      # --- CTI service endpoints (Docker network names) ---
+      MISP_BASE_URL: ${MISP_BASE_URL}
+      MISP_API_KEY: ${MISP_API_KEY}
+      OPENCTI_BASE_URL: ${OPENCTI_BASE_URL}
+      OPENCTI_API_KEY: ${OPENCTI_API_KEY}
+      THEHIVE_BASE_URL: ${THEHIVE_BASE_URL}
+      THEHIVE_API_KEY: ${THEHIVE_API_KEY}
+      CORTEX_BASE_URL: ${CORTEX_BASE_URL}
+      CORTEX_API_KEY: ${CORTEX_API_KEY}
+      FLOWISE_BASE_URL: ${FLOWISE_BASE_URL}
+      FLOWISE_API_KEY: ${FLOWISE_API_KEY}
+      SHUFFLE_BASE_URL: ${SHUFFLE_BASE_URL}
+      SHUFFLE_API_KEY: ${SHUFFLE_API_KEY}
+      XTM_BASE_URL: ${XTM_BASE_URL}
+      XTM_API_KEY: ${XTM_API_KEY}
+
+      # --- Approval notifications ---
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      APPROVAL_CHAT_ID: ${APPROVAL_CHAT_ID}
+
+      # --- Policy ---
+      DEFAULT_POLICY_SET: ${DEFAULT_POLICY_SET:-default-threatlab}
+
+    volumes:
+      - yaoc2-gateway-data:/home/node/.n8n
+    networks:
+      - cti-net        # existing shared network — grants access to all CTI services
+    depends_on:
+      - infra-postgres  # defined in the infra stack on the same cti-net
+
+volumes:
+  yaoc2-gateway-data:
+    name: yaoc2-gateway-data
+
+networks:
+  cti-net:
+    external: true   # already created by the infra stack
+    name: cti-net
