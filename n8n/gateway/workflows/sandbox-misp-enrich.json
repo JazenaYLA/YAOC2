@@ -1,0 +1,140 @@
+{
+  "name": "[YAOC2 Sandbox] MISP Enrich + OpenCTI Sync",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Sandbox workflow for action: ioc_enrichment_misp_opencti. Called by the policy gateway after an allow/approval decision. Receives action + parameters from the gateway, searches MISP for the IOC, enriches via Cortex analysers, pushes results to OpenCTI, and returns a structured result to the gateway.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst params = raw.parameters ?? {};\nconst ioc = params.ioc ?? params.value ?? params.indicator ?? null;\nconst iocType = params.ioc_type ?? params.type ?? 'ip-dst';\nif (!ioc) throw new Error('Sandbox: parameters.ioc is required');\nconst proposedActionId = raw.proposed_action_id ?? 'unknown';\nreturn [{ json: { ioc, ioc_type: iocType, proposed_action_id: proposedActionId, action: raw.action, requester: raw.requester } }];"
+      },
+      "id": "normalise-input",
+      "name": "Normalise Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.MISP_URL }}/attributes/restSearch",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ $env.MISP_API_KEY }}" },
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ returnFormat: 'json', value: $json.ioc, type: $json.ioc_type, limit: 10 }) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "misp-search",
+      "name": "MISP — Search Attribute",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const misp = $input.item.json;\nconst input = $('Normalise Input').first().json;\nconst attributes = misp.response?.Attribute ?? [];\nconst eventIds = [...new Set(attributes.map(a => a.event_id))];\nconst tags = attributes.flatMap(a => (a.Tag ?? []).map(t => t.name));\nconst uniqueTags = [...new Set(tags)];\nconst tlp = uniqueTags.find(t => t.toLowerCase().startsWith('tlp:')) ?? 'tlp:white';\nconst mispFound = attributes.length > 0;\nreturn [{ json: { ...input, misp_found: mispFound, misp_attributes: attributes, misp_event_ids: eventIds, misp_tags: uniqueTags, tlp } }];"
+      },
+      "id": "parse-misp",
+      "name": "Parse MISP Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CORTEX_URL }}/api/analyzer/Abuse_Finder_3_0/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.CORTEX_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ data: $json.ioc, dataType: $json.ioc_type, tlp: $json.tlp === 'tlp:red' ? 3 : $json.tlp === 'tlp:amber' ? 2 : 1 }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "cortex-analyse",
+      "name": "Cortex — Run Analyser",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cortex = $input.item.json;\nconst input = $('Parse MISP Results').first().json;\nconst jobId = cortex.id ?? null;\nconst status = cortex.status ?? 'unknown';\nreturn [{ json: { ...input, cortex_job_id: jobId, cortex_status: status } }];"
+      },
+      "id": "parse-cortex",
+      "name": "Parse Cortex Job",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCTI_URL }}/graphql",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.OPENCTI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ query: `mutation CreateObservable($value: String!, $type: String!) { stixCyberObservableAdd(type: $type, simple_observable_value: $value, simple_observable_key: \\"${$json.ioc_type}\\") { id standard_id } }`, variables: { value: $json.ioc, type: $json.ioc_type } }) }}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "opencti-push",
+      "name": "OpenCTI — Push Observable",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const opencti = $input.item.json;\nconst input = $('Parse Cortex Job').first().json;\nconst openctiId = opencti.data?.stixCyberObservableAdd?.id ?? null;\nconst success = !!openctiId;\nconst resultSummary = success\n  ? `IOC ${input.ioc} (${input.ioc_type}) enriched. MISP hits: ${input.misp_attributes.length}. Cortex job: ${input.cortex_job_id}. OpenCTI ID: ${openctiId}.`\n  : `IOC ${input.ioc} processed. MISP hits: ${input.misp_attributes.length}. OpenCTI push failed.`;\nreturn [{ json: {\n  status: success ? 'success' : 'partial',\n  result_summary: resultSummary,\n  raw_result_ref: openctiId,\n  ioc: input.ioc,\n  ioc_type: input.ioc_type,\n  misp_found: input.misp_found,\n  misp_event_ids: input.misp_event_ids,\n  cortex_job_id: input.cortex_job_id,\n  opencti_id: openctiId,\n  proposed_action_id: input.proposed_action_id\n} }];"
+      },
+      "id": "build-result",
+      "name": "Build Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 0]
+    }
+  ],
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Normalise Input", "type": "main", "index": 0 }]] },
+    "Normalise Input": { "main": [[{ "node": "MISP — Search Attribute", "type": "main", "index": 0 }]] },
+    "MISP — Search Attribute": { "main": [[{ "node": "Parse MISP Results", "type": "main", "index": 0 }]] },
+    "Parse MISP Results": { "main": [[{ "node": "Cortex — Run Analyser", "type": "main", "index": 0 }]] },
+    "Cortex — Run Analyser": { "main": [[{ "node": "Parse Cortex Job", "type": "main", "index": 0 }]] },
+    "Parse Cortex Job": { "main": [[{ "node": "OpenCTI — Push Observable", "type": "main", "index": 0 }]] },
+    "OpenCTI — Push Observable": { "main": [[{ "node": "Build Result", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "sandbox", "misp", "opencti", "cortex"]
+}
