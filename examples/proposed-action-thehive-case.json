@@ -1,0 +1,61 @@
+{
+  "id": "c3d7f1a2-8e44-4c91-b2f0-77a9d3e05b21",
+  "timestamp": "2026-03-19T15:30:00Z",
+  "agent": {
+    "name": "yaoc2-threat-analyst",
+    "version": "2026.03.1",
+    "session_id": "telegram-1235"
+  },
+  "requester": {
+    "user_id": "vin-001",
+    "display_name": "Vinnie",
+    "channel": "telegram",
+    "tenant": "threatlabs"
+  },
+  "intent": {
+    "title": "Create TheHive case for suspicious IP",
+    "description": "User asked to open a case in TheHive for IP 1.2.3.4 with severity high.",
+    "user_prompt": "Open a TheHive case for 1.2.3.4, severity high"
+  },
+  "action": {
+    "type": "workflow",
+    "name": "case_create_thehive",
+    "target_system": "thehive",
+    "mode": "read-write",
+    "parameters": {
+      "title": "Suspicious IP 1.2.3.4 — analyst review",
+      "description": "IP flagged by user for enrichment and investigation.",
+      "severity": 3,
+      "tlp": 2,
+      "tags": ["ip", "yaoc2-auto"],
+      "observables": [
+        { "type": "ip", "value": "1.2.3.4" }
+      ]
+    }
+  },
+  "risk": {
+    "level": "medium",
+    "reasons": [
+      "Creates a case in TheHive",
+      "Adds an observable"
+    ],
+    "estimated_impact": "Creates a new investigation case; no infra impact"
+  },
+  "constraints": {
+    "must_complete_before": "2026-03-19T17:00:00Z",
+    "max_cost_units": 5,
+    "dry_run": false
+  },
+  "policy": {
+    "policy_set": "default-threatlab",
+    "required_approvals": [
+      { "role": "threat-analyst", "count": 1 }
+    ]
+  },
+  "llm_explanation": {
+    "reasoning_summary": "User wants a TheHive case for an IP. I will create a case with severity 3 and attach the IP as an observable.",
+    "alternatives_considered": [
+      "Only log to MISP without creating a TheHive case"
+    ]
+  }
+}

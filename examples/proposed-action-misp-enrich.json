@@ -1,0 +1,58 @@
+{
+  "id": "b1a0e0d4-5b26-4bf6-9f0c-59e5b2c09f32",
+  "timestamp": "2026-03-19T15:00:00Z",
+  "agent": {
+    "name": "yaoc2-threat-analyst",
+    "version": "2026.03.1",
+    "session_id": "telegram-1234"
+  },
+  "requester": {
+    "user_id": "vin-001",
+    "display_name": "Vinnie",
+    "channel": "telegram",
+    "tenant": "threatlabs"
+  },
+  "intent": {
+    "title": "Enrich IP in MISP and sync to OpenCTI",
+    "description": "User asked to enrich 1.2.3.4 in MISP and update OpenCTI.",
+    "user_prompt": "Enrich 1.2.3.4 in MISP and update OpenCTI"
+  },
+  "action": {
+    "type": "workflow",
+    "name": "ioc_enrichment_misp_opencti",
+    "target_system": "misp-opencti",
+    "mode": "read-write",
+    "parameters": {
+      "observable_type": "ip",
+      "observable_value": "1.2.3.4",
+      "create_event_if_missing": true,
+      "push_to_opencti": true
+    }
+  },
+  "risk": {
+    "level": "medium",
+    "reasons": [
+      "Writes to MISP events",
+      "Syncs data into OpenCTI"
+    ],
+    "estimated_impact": "Changes threat intel data; no infra impact"
+  },
+  "constraints": {
+    "must_complete_before": "2026-03-19T17:00:00Z",
+    "max_cost_units": 10,
+    "dry_run": false
+  },
+  "policy": {
+    "policy_set": "default-threatlab",
+    "required_approvals": [
+      { "role": "threat-analyst", "count": 1 }
+    ]
+  },
+  "llm_explanation": {
+    "reasoning_summary": "User wants to enrich an IP. I will search MISP, create an event if missing, then sync to OpenCTI.",
+    "alternatives_considered": [
+      "Read-only MISP search only",
+      "Query public OSINT feeds only"
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+meta:
+  name: lab-highrisk
+  version: "2026.03.1"
+  description: High-risk policy set. Enables actions that default-threatlab denies. Use only in controlled lab sessions.
+
+defaults:
+  max_cost_units: 50
+  auto_allow_low_risk: true
+  auto_deny_critical_without_approval: false
+
+rules:
+
+  - id: allow-thehive-admin-with-approval
+    description: Admin TheHive operations allowed with soc-lead approval in lab.
+    match:
+      target_system: thehive
+      mode: admin
+    decision: needs-approval
+    approvers:
+      role: soc-lead
+      count: 1
+
+  - id: allow-shuffle-soar-auto
+    description: Auto-allow Shuffle playbooks in lab (no approval required).
+    match:
+      target_system: shuffle
+      action_name: "*"
+      min_risk_level: medium
+    decision: allow
+
+  - id: allow-critical-with-approval
+    description: Critical risk actions allowed with soc-lead approval in lab.
+    match:
+      min_risk_level: critical
+      target_system: "*"
+      action_name: "*"
+    decision: needs-approval
+    approvers:
+      role: soc-lead
+      count: 1

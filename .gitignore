@@ -1,24 +1,11 @@
-# Environment files
+# Environment files — never commit real secrets
 .env
-**/.env
-!**/.env.example
+infra/docker/n8n-brain/.env
+infra/docker/n8n-gateway/.env
 
-# Secrets
-*.key
-*.pem
-*.cert
-*.crt
-secrets/
-
-# n8n exports with credentials
-lxc-n8nclaw/workflows/with-credentials/
-
-# Flowise exports with credentials
-lxc-flowise/chatflows/with-credentials/
-
-# Local overrides
-*.local
-docker-compose.override.yml
+# n8n data directories
+n8n-data/
+*.n8n/
 
 # OS
 .DS_Store
@@ -28,12 +15,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
-*.swo
 
 # Logs
 *.log
 logs/
-
-# Temporary
-tmp/
-.tmp/

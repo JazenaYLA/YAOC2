@@ -1,0 +1,70 @@
+version: "3.8"
+
+services:
+  n8n-gateway:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5679:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-gateway-postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n_gateway
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      WEBHOOK_URL: ${GATEWAY_WEBHOOK_URL}
+      GENERIC_TIMEZONE: America/Chicago
+      TZ: America/Chicago
+      GATEWAY_WEBHOOK_SECRET: ${GATEWAY_WEBHOOK_SECRET}
+      # CTI service endpoints
+      MISP_BASE_URL: ${MISP_BASE_URL}
+      MISP_API_KEY: ${MISP_API_KEY}
+      OPENCTI_BASE_URL: ${OPENCTI_BASE_URL}
+      OPENCTI_API_KEY: ${OPENCTI_API_KEY}
+      THEHIVE_BASE_URL: ${THEHIVE_BASE_URL}
+      THEHIVE_API_KEY: ${THEHIVE_API_KEY}
+      CORTEX_BASE_URL: ${CORTEX_BASE_URL}
+      CORTEX_API_KEY: ${CORTEX_API_KEY}
+      FLOWISE_BASE_URL: ${FLOWISE_BASE_URL}
+      FLOWISE_API_KEY: ${FLOWISE_API_KEY}
+      SHUFFLE_BASE_URL: ${SHUFFLE_BASE_URL}
+      SHUFFLE_API_KEY: ${SHUFFLE_API_KEY}
+      XTM_BASE_URL: ${XTM_BASE_URL}
+      XTM_API_KEY: ${XTM_API_KEY}
+      # Approval notifications
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      APPROVAL_CHAT_ID: ${APPROVAL_CHAT_ID}
+    depends_on:
+      n8n-gateway-postgres:
+        condition: service_healthy
+    volumes:
+      - n8n-gateway-data:/home/node/.n8n
+    networks:
+      - yaoc2-gateway-net
+
+  n8n-gateway-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n_gateway
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - n8n-gateway-postgres-data:/var/lib/postgresql/data
+    networks:
+      - yaoc2-gateway-net
+
+volumes:
+  n8n-gateway-data:
+  n8n-gateway-postgres-data:
+
+networks:
+  yaoc2-gateway-net:
+    driver: bridge

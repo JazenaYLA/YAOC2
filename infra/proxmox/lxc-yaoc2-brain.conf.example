@@ -1,0 +1,24 @@
+# Proxmox LXC config example for lxc-yaoc2-brain
+# Copy to /etc/pve/lxc/<vmid>.conf and adjust vmid, IP, and storage as needed.
+
+arch: amd64
+cores: 2
+memory: 4096
+swap: 512
+ostype: debian
+hostname: yaoc2-brain
+onboot: 1
+start: 1
+unprivileged: 1
+
+# Rootfs — adjust storage name and size
+rootfs: local-zfs:subvol-<vmid>-disk-0,size=20G
+
+# Network — attach to cti-net bridge, set IP
+net0: name=eth0,bridge=cti-net,ip=10.10.10.50/24,gw=10.10.10.1,firewall=1
+
+# Features needed for Docker inside the LXC
+features: nesting=1,keyctl=1
+
+# Optional: bind-mount for n8n data persistence on ZFS dataset
+# mp0: /mnt/pve/cti-data/yaoc2-brain,mp=/data,backup=1

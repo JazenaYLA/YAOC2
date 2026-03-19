@@ -1,139 +1,142 @@
-# YAOC2 — Yet Another OpenClaw Clone 2
+# YAOC2 – Yet Another OpenClaw Clone
 
-A self-hosted, Proxmox VE–native implementation of **OpenClaw + NemoClaw** capabilities, built on **n8n** (agent brain), **Flowise AI** (sub-agent reasoning), and **Shuffle** (SOAR execution). Designed to mirror the enterprise-tier infra pattern of [threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack).
+YAOC2 is a self‑hosted, **policy‑aware** OpenClaw‑style agent framework built on n8n, Flowise and Shuffle, designed for CTI and SOC homelabs running on Proxmox VE.
 
----
+Instead of a single monolithic agent that directly touches all your tools, YAOC2 separates the **brain** (reasoning, skills, memory) from the **hands** (execution, SOAR), with a NemoClaw‑style policy gateway in between.
 
-## Architecture Overview
-
-```
-Proxmox VE Host
-├── lxc-n8nclaw          (n8n agent core — OpenClaw brain)
-├── lxc-flowise          (Flowise AI — sub-agent reasoning)
-├── lxc-postgres         (shared Postgres 17 — agent memory & policy store)
-├── lxc-valkey           (shared Valkey/Redis — session & queue)
-├── lxc-proxy            (Caddy — reverse proxy + TLS)
-├── lxc-infisical        (Infisical — secrets management)
-├── lxc-headscale        (Headscale — zero-trust overlay VPN)
-└── lxc-dockge-cti       (Dockge-managed Docker stack)
-    ├── xtm              (OpenCTI / OpenAEV)
-    └── shuffle          (Shuffle SOAR)
-```
-
-All services communicate over a **Headscale VPN mesh** (`yaoc2-net`) and optionally through the **Caddy** reverse proxy with `*.yaoc2.local` domains.
-
-See [docs/Architecture.md](docs/Architecture.md) for the full layered design.
+- **Brain**: n8n "OpenClaw clone" (fork of `n8n-claw`) with MCP‑style skills and memory.
+- **Gateway**: n8n policy engine that receives structured ProposedAction objects, enforces policies, and dispatches to sandboxed workflows or Shuffle.
+- **Execution**: thin n8n workflows and Shuffle playbooks that talk to MISP, OpenCTI, TheHive, XTM, etc., using your existing CTI stack.
 
 ---
 
-## Layered Design (OpenClaw + NemoClaw)
+## Architecture
 
-| Layer | Component | Responsibility |
-|---|---|---|
-| **Reasoning / Skills** | n8n (n8n-claw core) | Agent brain, MCP skills registry, long-term memory, multi-channel front-end |
-| **Sub-Agent Reasoning** | Flowise AI | Pluggable LLM chains called via HTTP from n8n |
-| **Policy Gateway** | n8n policy workflows | ProposedAction schema validation, allow/deny/approve |
-| **Execution / SOAR** | Shuffle playbooks | High-privilege actions (MISP, TheHive, OpenCTI, infra) |
-| **Sandbox Convention** | `sandbox.*` n8n workflows | All external tool calls go through here, never directly from LLM |
-| **Secrets** | Infisical | API keys, credentials, per-LXC env injection |
-| **Zero-Trust Net** | Headscale | Mesh VPN between all LXCs |
-| **Observability** | n8n execution logs → Postgres | Audit trail for all ProposedActions |
+YAOC2 is designed for an environment where most CTI/SOC apps run as Proxmox LXC containers, and heavy multi‑service stacks (like XTM and Shuffle) run inside a dedicated `dockge-cti` LXC.
+
+| LXC | Role | n8n Instance | Outbound Access |
+|---|---|---|---|
+| `lxc-yaoc2-brain` | Reasoning, skills, memory | Instance A (port 5678) | Gateway only |
+| `lxc-yaoc2-gateway` | Policy engine + sandbox execution | Instance B (port 5679) | All CTI LXCs, dockge-cti |
+| `lxc-dockge-cti` | XTM, Shuffle (existing) | — | Internet, CTI LXCs |
+| CTI LXCs | MISP, OpenCTI, TheHive, Flowise (existing) | — | cti-net only |
+
+The only trust edge is: `n8n-brain → n8n-gateway → CTI services / Shuffle`.
+
+See [`docs/architecture.md`](docs/architecture.md) and [`docs/networking.md`](docs/networking.md) for full details.
 
 ---
 
-## Directory Structure
+## Repository Layout
 
+```text
+yaoc2/
+  README.md
+  .env.example
+  .gitignore
+
+  docs/
+    architecture.md
+    networking.md
+    policies.md
+    threat-model.md
+
+  infra/
+    proxmox/
+      lxc-yaoc2-brain.conf.example
+      lxc-yaoc2-gateway.conf.example
+    docker/
+      n8n-brain/
+        docker-compose.yml
+        .env.example
+      n8n-gateway/
+        docker-compose.yml
+        .env.example
+
+  n8n/
+    brain/
+      workflows/
+        yaoc2-brain-openclaw.json
+      mcp-templates/
+        README.md
+    gateway/
+      workflows/
+        yaoc2-policy-gateway.json
+        yaoc2-sandbox-misp-enrich.json
+        yaoc2-sandbox-opencti-sync.json
+        yaoc2-sandbox-thehive-case.json
+
+  policies/
+    policy-sets/
+      default-threatlab.yaml
+      lab-highrisk.yaml
+
+  tools/
+    flowise/
+      example-flows.md
+    shuffle/
+      playbooks.md
+      misp-enrich-opencti-sync.yaml
+
+  examples/
+    proposed-action-misp-enrich.json
+    proposed-action-thehive-case.json
 ```
-YAOC2/
-├── docs/                   # Architecture, deployment guides, troubleshooting
-├── infra/                  # Proxmox LXC provisioning scripts (shared for all LXCs)
-├── lxc-n8nclaw/            # n8n agent LXC — setup, config, n8n workflow exports
-├── lxc-flowise/            # Flowise AI LXC — setup, config, chatflow exports
-├── lxc-postgres/           # Shared Postgres LXC — init SQL, setup script
-├── lxc-valkey/             # Shared Valkey/Redis LXC — config, setup script
-├── lxc-proxy/              # Caddy LXC — Caddyfile templates
-├── lxc-infisical/          # Infisical secrets LXC — setup script
-├── lxc-headscale/          # Headscale VPN LXC — config template
-├── lxc-dockge-cti/         # Dockge-managed Docker stack LXC
-│   ├── xtm/                # OpenCTI + OpenAEV
-│   └── shuffle/            # Shuffle SOAR
-├── policy/                 # ProposedAction schema, policy YAML configs
-├── sandbox/                # Sandbox n8n workflow stubs (exported JSON)
-├── scripts/                # Helper scripts: setup.sh, reset.sh, sync-identity.sh
-├── .env.example            # Root-level env template
-├── .gitignore
-└── README.md
-```
+
+---
+
+## ProposedAction Schema
+
+The brain never calls CTI tools directly. Instead it emits a structured ProposedAction JSON object and sends it to the gateway via Webhook or `Execute Workflow`.
+
+Core fields:
+
+- `id`, `timestamp`
+- `agent`: name, version, session_id
+- `requester`: user_id, display_name, channel, tenant
+- `intent`: title, description, user_prompt
+- `action`: type, name, target_system, mode, parameters
+- `risk`: level, reasons, estimated_impact
+- `constraints`: must_complete_before, max_cost_units, dry_run
+- `policy`: policy_set, required_approvals
+
+See `examples/proposed-action-misp-enrich.json` for a full example.
+
+---
+
+## Policy Model
+
+Policies live as YAML files under `policies/policy-sets/` (or mirrored into Postgres). The gateway evaluates ProposedAction objects against these rules and decides: `allow`, `deny`, or `needs-approval`.
+
+See [`docs/policies.md`](docs/policies.md) for the full policy schema and rule examples.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- Proxmox VE 8.x host
-- Debian 12 LXC template available
-- `pct` CLI access from the Proxmox shell
-- Cloudflare account (optional, for tunnel access)
+1. **Create two LXC containers in Proxmox** — `lxc-yaoc2-brain` and `lxc-yaoc2-gateway`.
+2. **Clone this repo** into each LXC.
+3. **Copy and fill in `.env`** files — see `infra/docker/n8n-brain/.env.example` and `infra/docker/n8n-gateway/.env.example`.
+4. **Bring up n8n** in each LXC: `docker compose up -d`.
+5. **Import n8n workflows** from `n8n/brain/workflows/` into the brain instance, and `n8n/gateway/workflows/` into the gateway instance.
+6. **Configure credentials** for MISP, OpenCTI, TheHive, Shuffle, Flowise, XTM in the gateway n8n instance.
+7. **Set up firewall rules** so the brain can only reach the gateway, and the gateway can reach CTI LXCs and `dockge-cti`.
+8. **Connect a front‑end** (Telegram bot, Discord bot, etc.) to the brain's webhook.
 
-### 1. Clone
-
-```bash
-git clone https://github.com/JazenaYLA/YAOC2.git
-cd YAOC2
-```
-
-### 2. Configure
-
-```bash
-cp .env.example .env
-# Edit .env — set your IPs, passwords, API keys
-```
-
-### 3. Provision LXCs
-
-Run the master provisioning script from your **Proxmox host shell**:
-
-```bash
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-```
-
-This will:
-1. Create all LXCs (Postgres, Valkey, Caddy, Infisical, Headscale, n8n, Flowise)
-2. Bootstrap the `lxc-dockge-cti` Docker stack
-3. Start XTM (OpenCTI) and Shuffle inside Dockge
-4. Output connection details and next steps
-
-### 4. Import n8n Workflows
-
-See [lxc-n8nclaw/README.md](lxc-n8nclaw/README.md) for importing the agent brain, policy gateway, and sandbox workflows.
-
-### 5. Import Flowise Chatflows
-
-See [lxc-flowise/README.md](lxc-flowise/README.md) for sub-agent chain imports.
-
----
-
-## Documentation
-
-- [Architecture & Design Decisions](docs/Architecture.md)
-- [LXC Provisioning Guide](docs/LXC-Provisioning.md)
-- [n8n-claw Agent Setup](docs/n8nclaw-Setup.md)
-- [Policy Gateway Design](docs/Policy-Gateway.md)
-- [Sandbox Convention](docs/Sandbox-Convention.md)
-- [Shuffle Playbook Guide](docs/Shuffle-Playbooks.md)
-- [Flowise Sub-Agent Guide](docs/Flowise-SubAgents.md)
-- [Headscale Zero-Trust Setup](docs/Headscale.md)
-- [Reverse Proxy Guide](docs/Reverse-Proxy.md)
-- [Troubleshooting](docs/Troubleshooting.md)
+See [`docs/architecture.md`](docs/architecture.md) for the full installation walkthrough.
 
 ---
 
 ## Credits
 
-Built on top of:
-- [freddy-schuetz/n8n-claw](https://github.com/freddy-schuetz/n8n-claw) — n8n OpenClaw re-implementation
-- [shabbirun/n8nclaw](https://github.com/shabbirun/n8nclaw) — lightweight OpenClaw n8n reference
-- [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) — policy/sandbox inspiration
-- [openclaw/openclaw](https://github.com/openclaw/openclaw) — original OpenClaw
-- [JazenaYLA/threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack) — infra pattern
+- [freddy-schuetz/n8n-claw](https://github.com/freddy-schuetz/n8n-claw) — n8n OpenClaw implementation that forms the basis of the brain layer.
+- [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) — inspiration for the policy gateway and sandbox execution model.
+- [openclaw/openclaw](https://github.com/openclaw/openclaw) — original OpenClaw agent framework.
+- [Shuffle SOAR](https://github.com/Shuffle/Shuffle) — SOAR execution layer.
+- [threatlabs-cti-stack](https://github.com/JazenaYLA/threatlabs-cti-stack) — the Proxmox CTI homelab this is designed to extend.
+
+---
+
+## License
+
+MIT

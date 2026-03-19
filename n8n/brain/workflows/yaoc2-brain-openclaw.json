@@ -1,0 +1,72 @@
+{
+  "meta": {
+    "instanceId": "yaoc2-brain"
+  },
+  "name": "YAOC2 Brain (OpenClaw)",
+  "description": "Main brain workflow. Fork of n8n-claw (freddy-schuetz). Receives user messages, reasons over intent, builds ProposedAction objects, and sends them to the YAOC2 policy gateway. Does NOT call CTI services directly.",
+  "nodes": [
+    {
+      "id": "trigger-telegram",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "notes": "User-facing front-end. Replace or supplement with Discord, Web Chat, or API Webhook as needed."
+    },
+    {
+      "id": "load-memory",
+      "name": "Load Memory (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "notes": "Load conversation history and project memory for this user/session from the brain Postgres DB."
+    },
+    {
+      "id": "llm-reason",
+      "name": "LLM Reasoning",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "notes": "Main reasoning step. Given user message + memory + available skills, decide what action(s) to take. Must NOT produce raw CTI API calls. Must produce structured intent."
+    },
+    {
+      "id": "build-proposed-action",
+      "name": "Build ProposedAction (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Translate LLM output into a valid ProposedAction JSON object. Validate required fields. Assign risk level based on action type and mode."
+    },
+    {
+      "id": "call-gateway",
+      "name": "Call Gateway (HTTP Request)",
+      "type": "n8n-nodes-base.httpRequest",
+      "notes": "POST ProposedAction to the YAOC2 policy gateway webhook. Include GATEWAY_WEBHOOK_SECRET in Authorization header."
+    },
+    {
+      "id": "handle-gateway-response",
+      "name": "Handle Gateway Response (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Parse final_status and result_summary from gateway response. Format user-friendly reply."
+    },
+    {
+      "id": "save-memory",
+      "name": "Save Memory (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "notes": "Persist updated conversation history and any new project memory entries."
+    },
+    {
+      "id": "reply-telegram",
+      "name": "Reply to User (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "notes": "Send formatted reply back to the user."
+    }
+  ],
+  "connections": {
+    "trigger-telegram": { "main": [[{ "node": "load-memory" }]] },
+    "load-memory": { "main": [[{ "node": "llm-reason" }]] },
+    "llm-reason": { "main": [[{ "node": "build-proposed-action" }]] },
+    "build-proposed-action": { "main": [[{ "node": "call-gateway" }]] },
+    "call-gateway": { "main": [[{ "node": "handle-gateway-response" }]] },
+    "handle-gateway-response": { "main": [[{ "node": "save-memory" }]] },
+    "save-memory": { "main": [[{ "node": "reply-telegram" }]] }
+  },
+  "TODO": [
+    "Wire actual n8n-claw (freddy) workflows as sub-workflows for skills (web search, reminders, briefings).",
+    "Add MCP skill registry nodes.",
+    "Add proactive task / heartbeat trigger.",
+    "Replace placeholder node types with actual n8n node IDs and parameters."
+  ]
+}

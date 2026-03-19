@@ -1,0 +1,51 @@
+# Shuffle Playbook: MISP Enrich + OpenCTI Sync
+# This is a description/blueprint. Build in Shuffle UI and export the actual playbook JSON.
+
+name: misp-enrich-opencti-sync
+version: "2026.03.1"
+trigger: webhook
+
+steps:
+  - name: receive-input
+    description: Receive validated parameters from YAOC2 gateway.
+    input_fields:
+      - observable_type
+      - observable_value
+      - create_event_if_missing
+      - push_to_opencti
+
+  - name: search-misp
+    description: Search MISP for existing events matching the observable.
+    app: MISP
+    action: search_attributes
+    parameters:
+      value: "{{ observable_value }}"
+      type: "{{ observable_type }}"
+
+  - name: cortex-enrich
+    description: Run Cortex analyzers on the observable.
+    app: Cortex
+    action: run_analyzer
+    parameters:
+      dataType: "{{ observable_type }}"
+      data: "{{ observable_value }}"
+      analyzers: ["AbuseIPDB_2_0", "VirusTotal_GetReport_3_1"]
+
+  - name: sync-opencti
+    description: Push enriched observable to OpenCTI.
+    condition: "{{ push_to_opencti }} == true"
+    app: OpenCTI
+    action: create_observable
+    parameters:
+      type: "{{ observable_type }}"
+      value: "{{ observable_value }}"
+      confidence: "{{ cortex-enrich.confidence }}"
+      tags: "{{ cortex-enrich.tags }}"
+
+  - name: return-result
+    description: Return result to YAOC2 gateway.
+    output:
+      misp_event_id: "{{ search-misp.event_id }}"
+      cortex_report: "{{ cortex-enrich.report }}"
+      opencti_id: "{{ sync-opencti.id }}"
+      status: success

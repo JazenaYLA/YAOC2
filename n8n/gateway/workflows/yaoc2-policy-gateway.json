@@ -1,0 +1,113 @@
+{
+  "meta": {
+    "instanceId": "yaoc2-gateway"
+  },
+  "name": "YAOC2 Policy Gateway",
+  "description": "Central policy engine. Receives ProposedAction objects from the brain, validates them, evaluates policies, optionally requests human approval, dispatches to sandbox workflows, and returns a result to the brain.",
+  "nodes": [
+    {
+      "id": "webhook-entry",
+      "name": "Webhook (ProposedAction Entry)",
+      "type": "n8n-nodes-base.webhook",
+      "notes": "Receives POST requests from the brain. Path: /proposed-action. Validate Authorization header against GATEWAY_WEBHOOK_SECRET."
+    },
+    {
+      "id": "validate-schema",
+      "name": "Validate Schema (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Check required fields: id, requester, intent, action.type, action.name, action.target_system, action.mode, risk.level, policy.policy_set. Strip unknown fields. Set item.valid = true/false and item.errors[]."
+    },
+    {
+      "id": "route-valid",
+      "name": "Route Valid/Invalid (Switch)",
+      "type": "n8n-nodes-base.switch",
+      "notes": "If item.valid === false → reject path. Else → policy lookup."
+    },
+    {
+      "id": "reject-invalid",
+      "name": "Reject Invalid (Respond to Webhook)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "notes": "Return 400 with error details."
+    },
+    {
+      "id": "load-policies",
+      "name": "Load Policies (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "notes": "SELECT rules FROM policy_sets WHERE name = {{ $json.policy.policy_set }} ORDER BY priority ASC. Store in item.policy_rules."
+    },
+    {
+      "id": "evaluate-policy",
+      "name": "Evaluate Policy (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Iterate item.policy_rules. Match on target_system, action_name, mode, min_risk_level, channel, tenant. First match wins. Output item.decision = 'allow' | 'deny' | 'needs-approval'. If no match, apply defaults from policy set."
+    },
+    {
+      "id": "route-decision",
+      "name": "Route Decision (Switch)",
+      "type": "n8n-nodes-base.switch",
+      "notes": "Branch on item.decision: allow → dispatcher. deny → reject. needs-approval → approval loop."
+    },
+    {
+      "id": "deny-action",
+      "name": "Deny Action (Respond to Webhook)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "notes": "Return 403 with denial reason. Log to audit table."
+    },
+    {
+      "id": "notify-approver",
+      "name": "Notify Approver (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "notes": "Send message to APPROVAL_CHAT_ID with action summary, risk level, and Approve/Reject inline keyboard buttons. Include proposed_action_id in callback data."
+    },
+    {
+      "id": "wait-approval",
+      "name": "Wait for Approval (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "notes": "Separate webhook path: /approval-callback. Receives Telegram callback query with proposed_action_id and decision (approve/reject). Timeout after configurable period → auto-deny."
+    },
+    {
+      "id": "record-approval",
+      "name": "Record Approval Decision (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "notes": "INSERT INTO audit_log (proposed_action_id, decision, approver_id, approved_at) VALUES (...). Update item.decision based on approver choice."
+    },
+    {
+      "id": "map-to-sandbox",
+      "name": "Map to Sandbox Workflow (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Lookup table: action.name → sandbox workflow ID. E.g. ioc_enrichment_misp_opencti → 'yaoc2-sandbox-misp-enrich'. Attach sandbox_workflow_id to item."
+    },
+    {
+      "id": "execute-sandbox",
+      "name": "Execute Sandbox Workflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "notes": "Call the resolved sandbox workflow with sanitised action.parameters only (no raw user text, no full ProposedAction). Capture result."
+    },
+    {
+      "id": "normalise-response",
+      "name": "Normalise Response (Code)",
+      "type": "n8n-nodes-base.code",
+      "notes": "Build standard response: { proposed_action_id, final_status, result_summary, raw_result_ref }. Log to audit table."
+    },
+    {
+      "id": "respond-to-brain",
+      "name": "Respond to Brain (Respond to Webhook)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "notes": "Return 200 with normalised response JSON."
+    }
+  ],
+  "connections": {
+    "webhook-entry": { "main": [[{ "node": "validate-schema" }]] },
+    "validate-schema": { "main": [[{ "node": "route-valid" }]] },
+    "route-valid": { "main": [[{ "node": "load-policies" }], [{ "node": "reject-invalid" }]] },
+    "load-policies": { "main": [[{ "node": "evaluate-policy" }]] },
+    "evaluate-policy": { "main": [[{ "node": "route-decision" }]] },
+    "route-decision": { "main": [[{ "node": "map-to-sandbox" }], [{ "node": "deny-action" }], [{ "node": "notify-approver" }]] },
+    "notify-approver": { "main": [[{ "node": "wait-approval" }]] },
+    "wait-approval": { "main": [[{ "node": "record-approval" }]] },
+    "record-approval": { "main": [[{ "node": "map-to-sandbox" }]] },
+    "map-to-sandbox": { "main": [[{ "node": "execute-sandbox" }]] },
+    "execute-sandbox": { "main": [[{ "node": "normalise-response" }]] },
+    "normalise-response": { "main": [[{ "node": "respond-to-brain" }]] }
+  }
+}

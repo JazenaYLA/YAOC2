@@ -1,0 +1,77 @@
+meta:
+  name: default-threatlab
+  version: "2026.03.1"
+  description: Default policy set for the threatlabs CTI homelab environment.
+
+defaults:
+  max_cost_units: 20
+  auto_allow_low_risk: true
+  auto_deny_critical_without_approval: true
+  default_approval_role: threat-analyst
+
+rules:
+
+  - id: read-only-always-allow
+    description: Any read-only operation on any system is auto-allowed.
+    match:
+      mode: read-only
+      target_system: "*"
+      action_name: "*"
+    decision: allow
+
+  - id: misp-opencti-medium-write
+    description: Medium-risk MISP/OpenCTI write operations need analyst approval.
+    match:
+      target_system: misp-opencti
+      action_name: ioc_enrichment_misp_opencti
+      mode: read-write
+      min_risk_level: medium
+    decision: needs-approval
+    approvers:
+      role: threat-analyst
+      count: 1
+
+  - id: opencti-sync-low
+    description: Low-risk OpenCTI sync is auto-allowed.
+    match:
+      target_system: opencti
+      action_name: opencti_sync
+      min_risk_level: low
+      mode: read-write
+    decision: allow
+
+  - id: thehive-case-create
+    description: Creating a TheHive case requires analyst approval.
+    match:
+      target_system: thehive
+      action_name: case_create_thehive
+      mode: read-write
+    decision: needs-approval
+    approvers:
+      role: threat-analyst
+      count: 1
+
+  - id: thehive-admin-block
+    description: Admin-level TheHive operations are always denied in default policy.
+    match:
+      target_system: thehive
+      mode: admin
+    decision: deny
+
+  - id: shuffle-soar
+    description: Shuffle SOAR playbook triggers always need approval.
+    match:
+      target_system: shuffle
+      action_name: "*"
+    decision: needs-approval
+    approvers:
+      role: soc-lead
+      count: 1
+
+  - id: critical-deny-all
+    description: Critical risk actions are denied unless explicitly allowed by a higher-priority rule.
+    match:
+      min_risk_level: critical
+      target_system: "*"
+      action_name: "*"
+    decision: deny
