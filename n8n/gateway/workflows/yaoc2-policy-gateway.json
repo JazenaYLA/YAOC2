@@ -1,113 +1,358 @@
 {
-  "meta": {
-    "instanceId": "yaoc2-gateway"
+  "name": "[YAOC2] Policy Gateway",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "NemoClaw-style policy gateway. Receives ProposedAction from brain, validates schema, loads policy from infra-postgres, evaluates rules, routes to allow/deny/needs-approval, dispatches approved actions to sandbox workflows, writes audit log, responds to brain.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "any",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
   },
-  "name": "YAOC2 Policy Gateway",
-  "description": "Central policy engine. Receives ProposedAction objects from the brain, validates them, evaluates policies, optionally requests human approval, dispatches to sandbox workflows, and returns a result to the brain.",
   "nodes": [
     {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "proposed-action",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
       "id": "webhook-entry",
-      "name": "Webhook (ProposedAction Entry)",
+      "name": "Webhook — Receive ProposedAction",
       "type": "n8n-nodes-base.webhook",
-      "notes": "Receives POST requests from the brain. Path: /proposed-action. Validate Authorization header against GATEWAY_WEBHOOK_SECRET."
+      "typeVersion": 2,
+      "position": [0, 0],
+      "credentials": { "httpHeaderAuth": { "id": "REPLACE_GATEWAY_WEBHOOK_CREDENTIAL", "name": "Gateway Webhook Secret" } },
+      "webhookId": "yaoc2-proposed-action"
     },
     {
+      "parameters": {
+        "jsCode": "// See n8n/gateway/code/validate-schema.js\nconst REQUIRED_TOP = ['id','timestamp','agent','requester','intent','action','risk','policy'];\nconst REQUIRED_REQUESTER = ['user_id','channel','tenant'];\nconst REQUIRED_ACTION = ['type','name','target_system','mode'];\nconst REQUIRED_RISK = ['level'];\nconst REQUIRED_POLICY = ['policy_set'];\nconst VALID_ACTION_TYPES = ['workflow','http_call','shell','external_soar'];\nconst VALID_MODES = ['read-only','read-write','admin'];\nconst VALID_RISK_LEVELS = ['low','medium','high','critical'];\nconst VALID_CHANNELS = ['telegram','discord','web','api'];\nconst ALLOWED_TOP = new Set(['id','timestamp','agent','requester','intent','action','risk','constraints','policy','llm_explanation']);\nconst errors = [];\nconst body = $input.item.json.body ?? $input.item.json;\nconst stripped = {};\nfor (const key of Object.keys(body)) { if (ALLOWED_TOP.has(key)) stripped[key] = body[key]; }\nfor (const field of REQUIRED_TOP) { if (!stripped[field]) errors.push(`Missing required field: ${field}`); }\nif (stripped.id && !/^[0-9a-f-]{36}$/i.test(stripped.id)) errors.push('Field id must be a UUID v4 string');\nif (stripped.requester) { for (const f of REQUIRED_REQUESTER) { if (!stripped.requester[f]) errors.push(`Missing requester.${f}`); } if (stripped.requester.channel && !VALID_CHANNELS.includes(stripped.requester.channel)) errors.push(`requester.channel must be one of: ${VALID_CHANNELS.join(', ')}`); }\nif (stripped.action) { for (const f of REQUIRED_ACTION) { if (!stripped.action[f]) errors.push(`Missing action.${f}`); } if (stripped.action.type && !VALID_ACTION_TYPES.includes(stripped.action.type)) errors.push(`action.type must be one of: ${VALID_ACTION_TYPES.join(', ')}`); if (stripped.action.mode && !VALID_MODES.includes(stripped.action.mode)) errors.push(`action.mode must be one of: ${VALID_MODES.join(', ')}`); if (stripped.action.parameters) { for (const [k,v] of Object.entries(stripped.action.parameters)) { if (typeof v === 'string' && v.length > 500) errors.push(`action.parameters.${k} exceeds 500 chars — raw prompt injection suspected`); } } }\nif (stripped.risk) { for (const f of REQUIRED_RISK) { if (!stripped.risk[f]) errors.push(`Missing risk.${f}`); } if (stripped.risk.level && !VALID_RISK_LEVELS.includes(stripped.risk.level)) errors.push(`risk.level must be one of: ${VALID_RISK_LEVELS.join(', ')}`); }\nif (stripped.policy) { for (const f of REQUIRED_POLICY) { if (!stripped.policy[f]) errors.push(`Missing policy.${f}`); } }\nreturn [{ json: { ...stripped, _gateway: { valid: errors.length === 0, errors } } }];"
+      },
       "id": "validate-schema",
-      "name": "Validate Schema (Code)",
+      "name": "Validate Schema",
       "type": "n8n-nodes-base.code",
-      "notes": "Check required fields: id, requester, intent, action.type, action.name, action.target_system, action.mode, risk.level, policy.policy_set. Strip unknown fields. Set item.valid = true/false and item.errors[]."
+      "typeVersion": 2,
+      "position": [240, 0]
     },
     {
-      "id": "route-valid",
-      "name": "Route Valid/Invalid (Switch)",
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "valid",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._gateway.valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "is-valid" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "invalid",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._gateway.valid }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" }, "id": "is-invalid" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "schema-route",
+      "name": "Schema Valid?",
       "type": "n8n-nodes-base.switch",
-      "notes": "If item.valid === false → reject path. Else → policy lookup."
+      "typeVersion": 3.4,
+      "position": [480, 0]
     },
     {
-      "id": "reject-invalid",
-      "name": "Reject Invalid (Respond to Webhook)",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: 'Schema validation failed', errors: $json._gateway.errors }) }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "respond-invalid",
+      "name": "Respond 400 Invalid",
       "type": "n8n-nodes-base.respondToWebhook",
-      "notes": "Return 400 with error details."
+      "typeVersion": 1.1,
+      "position": [720, 160]
     },
     {
-      "id": "load-policies",
-      "name": "Load Policies (Postgres)",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, version, defaults, rules FROM yaoc2.policy_sets WHERE name = $1 LIMIT 1",
+        "additionalFields": { "queryParams": "={{ [$json.policy.policy_set] }}" }
+      },
+      "id": "load-policy",
+      "name": "Load Policy Set",
       "type": "n8n-nodes-base.postgres",
-      "notes": "SELECT rules FROM policy_sets WHERE name = {{ $json.policy.policy_set }} ORDER BY priority ASC. Store in item.policy_rules."
+      "typeVersion": 2.5,
+      "position": [720, -160],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
     },
     {
+      "parameters": {
+        "jsCode": "// Merge loaded policy set into item\nconst item = $('Validate Schema').first().json;\nconst policyRow = $input.item.json;\nconst policySet = {\n  name:     policyRow.name,\n  version:  policyRow.version,\n  defaults: typeof policyRow.defaults === 'string' ? JSON.parse(policyRow.defaults) : policyRow.defaults,\n  rules:    typeof policyRow.rules    === 'string' ? JSON.parse(policyRow.rules)    : policyRow.rules,\n};\nreturn [{ json: { ...item, _policy_set: policySet } }];"
+      },
+      "id": "merge-policy",
+      "name": "Merge Policy into Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// See n8n/gateway/code/evaluate-policy.js\nconst RISK_ORDER = { low:0, medium:1, high:2, critical:3 };\nconst item = $input.item.json;\nconst action = item.action;\nconst requester = item.requester;\nconst risk = item.risk;\nconst policySet = item._policy_set;\nconst rules = policySet?.rules ?? [];\nconst defaults = policySet?.defaults ?? {};\nfunction matches(ruleVal, actualVal) { if (!ruleVal || ruleVal === '*') return true; return ruleVal === actualVal; }\nfunction meetsRiskThreshold(ruleMinLevel, actualLevel) { if (!ruleMinLevel) return true; return RISK_ORDER[actualLevel] >= RISK_ORDER[ruleMinLevel]; }\nfunction matchesRule(rule, action, requester, risk) { const m = rule.match || {}; return matches(m.target_system, action.target_system) && matches(m.action_name, action.name) && matches(m.mode, action.mode) && matches(m.channel, requester.channel) && matches(m.tenant, requester.tenant) && meetsRiskThreshold(m.min_risk_level, risk.level); }\nlet decision = null, approvers = null, matchedRule = null;\nfor (const rule of rules) { if (matchesRule(rule, action, requester, risk)) { decision = rule.decision; approvers = rule.approvers ?? null; matchedRule = rule.id; break; } }\nif (!decision) { const level = risk.level; if (level === 'low' && defaults.auto_allow_low_risk) { decision = 'allow'; matchedRule = '__default_low_allow'; } else if (level === 'critical' && defaults.auto_deny_critical_without_approval) { decision = 'deny'; matchedRule = '__default_critical_deny'; } else { decision = 'needs-approval'; approvers = { role: defaults.default_approval_role ?? 'threat-analyst', count: 1 }; matchedRule = '__default_needs_approval'; } }\nreturn [{ json: { ...item, _gateway: { ...item._gateway, decision, approvers, matched_rule: matchedRule } } }];"
+      },
       "id": "evaluate-policy",
-      "name": "Evaluate Policy (Code)",
+      "name": "Evaluate Policy",
       "type": "n8n-nodes-base.code",
-      "notes": "Iterate item.policy_rules. Match on target_system, action_name, mode, min_risk_level, channel, tenant. First match wins. Output item.decision = 'allow' | 'deny' | 'needs-approval'. If no match, apply defaults from policy set."
+      "typeVersion": 2,
+      "position": [1200, -160]
     },
     {
-      "id": "route-decision",
-      "name": "Route Decision (Switch)",
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "allow",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._gateway.decision }}", "rightValue": "allow", "operator": { "type": "string", "operation": "equals" }, "id": "dec-allow" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "deny",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._gateway.decision }}", "rightValue": "deny", "operator": { "type": "string", "operation": "equals" }, "id": "dec-deny" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "needs-approval",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._gateway.decision }}", "rightValue": "needs-approval", "operator": { "type": "string", "operation": "equals" }, "id": "dec-approval" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "decision-route",
+      "name": "Decision Route",
       "type": "n8n-nodes-base.switch",
-      "notes": "Branch on item.decision: allow → dispatcher. deny → reject. needs-approval → approval loop."
+      "typeVersion": 3.4,
+      "position": [1440, -160]
     },
     {
-      "id": "deny-action",
-      "name": "Deny Action (Respond to Webhook)",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "notes": "Return 403 with denial reason. Log to audit table."
-    },
-    {
-      "id": "notify-approver",
-      "name": "Notify Approver (Telegram)",
+      "parameters": {
+        "chatId": "={{ $env.APPROVAL_CHAT_ID }}",
+        "text": "={{ '🔐 *Approval Required*\\n\\n*Action:* ' + $json.action.name + '\\n*Target:* ' + $json.action.target_system + '\\n*Risk:* ' + $json.risk.level + '\\n*Requested by:* ' + $json.requester.display_name + '\\n*Intent:* ' + $json.intent.title + '\\n\\n*ID:* `' + $json.id + '`\\n\\nReply with the ID above and APPROVE or DENY.' }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-approval-request",
+      "name": "Telegram — Request Approval",
       "type": "n8n-nodes-base.telegram",
-      "notes": "Send message to APPROVAL_CHAT_ID with action summary, risk level, and Approve/Reject inline keyboard buttons. Include proposed_action_id in callback data."
+      "typeVersion": 1.2,
+      "position": [1680, 80],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
     },
     {
-      "id": "wait-approval",
-      "name": "Wait for Approval (Webhook)",
-      "type": "n8n-nodes-base.webhook",
-      "notes": "Separate webhook path: /approval-callback. Receives Telegram callback query with proposed_action_id and decision (approve/reject). Timeout after configurable period → auto-deny."
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'pending-approval', proposed_action_id: $json.id, message: 'Action requires approval. Analyst has been notified via Telegram.' }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "respond-pending",
+      "name": "Respond 202 Pending",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1920, 80]
     },
     {
-      "id": "record-approval",
-      "name": "Record Approval Decision (Postgres)",
-      "type": "n8n-nodes-base.postgres",
-      "notes": "INSERT INTO audit_log (proposed_action_id, decision, approver_id, approved_at) VALUES (...). Update item.decision based on approver choice."
-    },
-    {
+      "parameters": {
+        "jsCode": "// See n8n/gateway/code/map-to-sandbox.js\nconst SANDBOX_MAP = {\n  'ioc_enrichment_misp_opencti': 'YAOC2 Sandbox — MISP Enrich + OpenCTI Sync',\n  'opencti_sync': 'YAOC2 Sandbox — OpenCTI Sync',\n  'case_create_thehive': 'YAOC2 Sandbox — TheHive Case Create',\n};\nconst item = $input.item.json;\nconst actionName = item.action?.name;\nif (!actionName) throw new Error('action.name is missing');\nconst sandboxWorkflow = SANDBOX_MAP[actionName];\nif (!sandboxWorkflow) throw new Error(`No sandbox mapped for action.name: ${actionName}`);\nreturn [{ json: { ...item, _gateway: { ...item._gateway, sandbox_workflow_name: sandboxWorkflow, sandbox_input: item.action.parameters ?? {} } } }];"
+      },
       "id": "map-to-sandbox",
-      "name": "Map to Sandbox Workflow (Code)",
+      "name": "Map to Sandbox Workflow",
       "type": "n8n-nodes-base.code",
-      "notes": "Lookup table: action.name → sandbox workflow ID. E.g. ioc_enrichment_misp_opencti → 'yaoc2-sandbox-misp-enrich'. Attach sandbox_workflow_id to item."
+      "typeVersion": 2,
+      "position": [1680, -320]
     },
     {
+      "parameters": {
+        "workflowId": "={{ $json._gateway.sandbox_workflow_name }}",
+        "workflowInputs": {
+          "values": [
+            { "name": "action", "value": "={{ $json.action }}" },
+            { "name": "parameters", "value": "={{ $json._gateway.sandbox_input }}" },
+            { "name": "proposed_action_id", "value": "={{ $json.id }}" },
+            { "name": "requester", "value": "={{ $json.requester }}" }
+          ]
+        }
+      },
       "id": "execute-sandbox",
       "name": "Execute Sandbox Workflow",
       "type": "n8n-nodes-base.executeWorkflow",
-      "notes": "Call the resolved sandbox workflow with sanitised action.parameters only (no raw user text, no full ProposedAction). Capture result."
+      "typeVersion": 1.1,
+      "position": [1920, -320]
     },
     {
+      "parameters": {
+        "jsCode": "// See n8n/gateway/code/normalise-response.js\nconst item = $('Evaluate Policy').first().json;\nconst gateway = item._gateway ?? {};\nconst sandboxResult = $input.item.json ?? {};\nlet finalStatus;\nif (gateway.decision === 'deny') { finalStatus = 'denied'; }\nelse if (sandboxResult.status === 'success') { finalStatus = 'executed'; }\nelse if (sandboxResult.status === 'partial') { finalStatus = 'executed'; }\nelse if (!sandboxResult.status) { finalStatus = 'pending-approval'; }\nelse { finalStatus = 'failed'; }\nconst response = { proposed_action_id: item.id, final_status: finalStatus, result_summary: sandboxResult.result_summary ?? gateway.deny_reason ?? 'No result', raw_result_ref: sandboxResult.raw_result_ref ?? null };\nconst auditRecord = { proposed_action_id: item.id, timestamp: new Date().toISOString(), user_id: item.requester?.user_id, display_name: item.requester?.display_name, channel: item.requester?.channel, tenant: item.requester?.tenant, action_type: item.action?.type, action_name: item.action?.name, target_system: item.action?.target_system, action_mode: item.action?.mode, risk_level: item.risk?.level, policy_set: item.policy?.policy_set, decision: gateway.decision, approver_id: gateway.approver_id ?? null, approved_at: gateway.approved_at ?? null, final_status: finalStatus, result_summary: response.result_summary, raw_result_ref: response.raw_result_ref, proposed_action_raw: JSON.stringify(item), result_raw: JSON.stringify(sandboxResult) };\nreturn [{ json: { response, audit_record: auditRecord } }];"
+      },
       "id": "normalise-response",
-      "name": "Normalise Response (Code)",
+      "name": "Normalise Response",
       "type": "n8n-nodes-base.code",
-      "notes": "Build standard response: { proposed_action_id, final_status, result_summary, raw_result_ref }. Log to audit table."
+      "typeVersion": 2,
+      "position": [2160, -320]
     },
     {
-      "id": "respond-to-brain",
-      "name": "Respond to Brain (Respond to Webhook)",
+      "parameters": {
+        "operation": "insert",
+        "schema": "yaoc2",
+        "table": "audit_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "proposed_action_id": "={{ $json.audit_record.proposed_action_id }}",
+            "timestamp": "={{ $json.audit_record.timestamp }}",
+            "user_id": "={{ $json.audit_record.user_id }}",
+            "display_name": "={{ $json.audit_record.display_name }}",
+            "channel": "={{ $json.audit_record.channel }}",
+            "tenant": "={{ $json.audit_record.tenant }}",
+            "action_type": "={{ $json.audit_record.action_type }}",
+            "action_name": "={{ $json.audit_record.action_name }}",
+            "target_system": "={{ $json.audit_record.target_system }}",
+            "action_mode": "={{ $json.audit_record.action_mode }}",
+            "risk_level": "={{ $json.audit_record.risk_level }}",
+            "policy_set": "={{ $json.audit_record.policy_set }}",
+            "decision": "={{ $json.audit_record.decision }}",
+            "approver_id": "={{ $json.audit_record.approver_id }}",
+            "approved_at": "={{ $json.audit_record.approved_at }}",
+            "final_status": "={{ $json.audit_record.final_status }}",
+            "result_summary": "={{ $json.audit_record.result_summary }}",
+            "raw_result_ref": "={{ $json.audit_record.raw_result_ref }}",
+            "proposed_action_raw": "={{ $json.audit_record.proposed_action_raw }}",
+            "result_raw": "={{ $json.audit_record.result_raw }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "write-audit-log",
+      "name": "Write Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2400, -320],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Normalise Response').first().json.response) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-success",
+      "name": "Respond 200 Success",
       "type": "n8n-nodes-base.respondToWebhook",
-      "notes": "Return 200 with normalised response JSON."
+      "typeVersion": 1.1,
+      "position": [2640, -320]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $('Evaluate Policy').first().json;\nreturn [{ json: { ...item, _gateway: { ...item._gateway, deny_reason: `Action denied by policy rule: ${item._gateway.matched_rule}` } } }];"
+      },
+      "id": "build-deny",
+      "name": "Build Deny Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, -160]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "yaoc2",
+        "table": "audit_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "proposed_action_id": "={{ $json.id }}",
+            "timestamp": "={{ new Date().toISOString() }}",
+            "user_id": "={{ $json.requester?.user_id }}",
+            "display_name": "={{ $json.requester?.display_name }}",
+            "channel": "={{ $json.requester?.channel }}",
+            "tenant": "={{ $json.requester?.tenant }}",
+            "action_type": "={{ $json.action?.type }}",
+            "action_name": "={{ $json.action?.name }}",
+            "target_system": "={{ $json.action?.target_system }}",
+            "action_mode": "={{ $json.action?.mode }}",
+            "risk_level": "={{ $json.risk?.level }}",
+            "policy_set": "={{ $json.policy?.policy_set }}",
+            "decision": "deny",
+            "final_status": "denied",
+            "result_summary": "={{ $json._gateway.deny_reason }}",
+            "proposed_action_raw": "={{ JSON.stringify($json) }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "write-audit-deny",
+      "name": "Write Audit Log (Deny)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1920, -160],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'denied', proposed_action_id: $('Build Deny Response').first().json.id, message: $('Build Deny Response').first().json._gateway.deny_reason }) }}",
+        "options": { "responseCode": 403 }
+      },
+      "id": "respond-denied",
+      "name": "Respond 403 Denied",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2160, -160]
     }
   ],
   "connections": {
-    "webhook-entry": { "main": [[{ "node": "validate-schema" }]] },
-    "validate-schema": { "main": [[{ "node": "route-valid" }]] },
-    "route-valid": { "main": [[{ "node": "load-policies" }], [{ "node": "reject-invalid" }]] },
-    "load-policies": { "main": [[{ "node": "evaluate-policy" }]] },
-    "evaluate-policy": { "main": [[{ "node": "route-decision" }]] },
-    "route-decision": { "main": [[{ "node": "map-to-sandbox" }], [{ "node": "deny-action" }], [{ "node": "notify-approver" }]] },
-    "notify-approver": { "main": [[{ "node": "wait-approval" }]] },
-    "wait-approval": { "main": [[{ "node": "record-approval" }]] },
-    "record-approval": { "main": [[{ "node": "map-to-sandbox" }]] },
-    "map-to-sandbox": { "main": [[{ "node": "execute-sandbox" }]] },
-    "execute-sandbox": { "main": [[{ "node": "normalise-response" }]] },
-    "normalise-response": { "main": [[{ "node": "respond-to-brain" }]] }
-  }
+    "Webhook — Receive ProposedAction": { "main": [[{ "node": "Validate Schema", "type": "main", "index": 0 }]] },
+    "Validate Schema": { "main": [[{ "node": "Schema Valid?", "type": "main", "index": 0 }]] },
+    "Schema Valid?": {
+      "main": [
+        [{ "node": "Load Policy Set", "type": "main", "index": 0 }],
+        [{ "node": "Respond 400 Invalid", "type": "main", "index": 0 }]
+      ]
+    },
+    "Load Policy Set": { "main": [[{ "node": "Merge Policy into Item", "type": "main", "index": 0 }]] },
+    "Merge Policy into Item": { "main": [[{ "node": "Evaluate Policy", "type": "main", "index": 0 }]] },
+    "Evaluate Policy": { "main": [[{ "node": "Decision Route", "type": "main", "index": 0 }]] },
+    "Decision Route": {
+      "main": [
+        [{ "node": "Map to Sandbox Workflow", "type": "main", "index": 0 }],
+        [{ "node": "Build Deny Response", "type": "main", "index": 0 }],
+        [{ "node": "Telegram — Request Approval", "type": "main", "index": 0 }]
+      ]
+    },
+    "Map to Sandbox Workflow": { "main": [[{ "node": "Execute Sandbox Workflow", "type": "main", "index": 0 }]] },
+    "Execute Sandbox Workflow": { "main": [[{ "node": "Normalise Response", "type": "main", "index": 0 }]] },
+    "Normalise Response": { "main": [[{ "node": "Write Audit Log", "type": "main", "index": 0 }]] },
+    "Write Audit Log": { "main": [[{ "node": "Respond 200 Success", "type": "main", "index": 0 }]] },
+    "Build Deny Response": { "main": [[{ "node": "Write Audit Log (Deny)", "type": "main", "index": 0 }]] },
+    "Write Audit Log (Deny)": { "main": [[{ "node": "Respond 403 Denied", "type": "main", "index": 0 }]] },
+    "Telegram — Request Approval": { "main": [[{ "node": "Respond 202 Pending", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "policy", "nemoclaw"]
 }

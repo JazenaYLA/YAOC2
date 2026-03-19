@@ -1,72 +1,231 @@
 {
-  "meta": {
-    "instanceId": "yaoc2-brain"
+  "name": "[YAOC2] Brain — OpenClaw Agent",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "OpenClaw-style brain workflow. Receives user messages from Telegram, loads conversation memory from infra-postgres, reasons with LLM via tiered model router, builds a ProposedAction, POSTs to the YAOC2 policy gateway, handles the response, saves memory, and replies to the user.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "any",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
   },
-  "name": "YAOC2 Brain (OpenClaw)",
-  "description": "Main brain workflow. Fork of n8n-claw (freddy-schuetz). Receives user messages, reasons over intent, builds ProposedAction objects, and sends them to the YAOC2 policy gateway. Does NOT call CTI services directly.",
   "nodes": [
     {
-      "id": "trigger-telegram",
-      "name": "Telegram Trigger",
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram — Message Trigger",
       "type": "n8n-nodes-base.telegramTrigger",
-      "notes": "User-facing front-end. Replace or supplement with Discord, Web Chat, or API Webhook as needed."
+      "typeVersion": 1.1,
+      "position": [0, 0],
+      "webhookId": "yaoc2-brain-telegram",
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
     },
     {
+      "parameters": {
+        "jsCode": "// Extract and normalise Telegram message fields\nconst msg = $input.item.json.message ?? $input.item.json;\nconst userId   = String(msg.from?.id ?? 'unknown');\nconst username = msg.from?.username ?? msg.from?.first_name ?? userId;\nconst chatId   = String(msg.chat?.id ?? msg.from?.id ?? 'unknown');\nconst text     = msg.text ?? '';\nconst sessionId = `telegram-${chatId}`;\nreturn [{ json: {\n  user_message: text,\n  session_id: sessionId,\n  chat_id: chatId,\n  user: {\n    user_id: userId,\n    display_name: username,\n    channel: 'telegram',\n    tenant: 'threatlabs',\n  }\n} }];"
+      },
+      "id": "normalise-input",
+      "name": "Normalise Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT role, content, created_at FROM yaoc2.conversation_memory WHERE session_id = $1 ORDER BY created_at DESC LIMIT 20",
+        "additionalFields": { "queryParams": "={{ [$json.session_id] }}" }
+      },
       "id": "load-memory",
-      "name": "Load Memory (Postgres)",
+      "name": "Load Conversation Memory",
       "type": "n8n-nodes-base.postgres",
-      "notes": "Load conversation history and project memory for this user/session from the brain Postgres DB."
+      "typeVersion": 2.5,
+      "position": [480, 0],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
     },
     {
+      "parameters": {
+        "jsCode": "// Merge memory rows back with normalised input\nconst input = $('Normalise Input').first().json;\nconst memoryRows = $input.all().map(i => i.json);\n// Reverse so oldest first for LLM context\nconst history = [...memoryRows].reverse().map(r => ({ role: r.role, content: r.content }));\nreturn [{ json: { ...input, history } }];"
+      },
+      "id": "merge-memory",
+      "name": "Merge Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.user_message }}",
+        "options": {
+          "systemMessage": "You are a CTI threat analyst assistant running on YAOC2, a policy-gated agentic framework for a cybersecurity homelab.\n\nYour job is to understand what the analyst wants to do, reason about the best action to take across the available CTI tools (MISP, OpenCTI, TheHive, Cortex, Shuffle, Flowise, XTM), and produce a structured ProposedAction JSON.\n\nAvailable action names and their target systems:\n- ioc_enrichment_misp_opencti  → misp-opencti  (mode: read-write)\n- opencti_sync                 → opencti       (mode: read-write)\n- case_create_thehive          → thehive       (mode: read-write)\n- misp_search                  → misp          (mode: read-only)\n- opencti_search               → opencti       (mode: read-only)\n- thehive_search               → thehive       (mode: read-only)\n\nRules:\n1. Never invent action names not listed above.\n2. Parameters must be concise key-value pairs — never include full text blobs.\n3. If the request is ambiguous, ask for clarification instead of guessing.\n4. Your response MUST be valid JSON with this exact structure (no markdown, no prose):\n\n{\n  \"intent\": { \"title\": \"...\", \"description\": \"...\" },\n  \"action\": { \"type\": \"workflow\", \"name\": \"...\", \"target_system\": \"...\", \"mode\": \"...\", \"parameters\": {} },\n  \"risk_reasons\": [],\n  \"estimated_impact\": \"...\",\n  \"reasoning_summary\": \"...\",\n  \"alternatives_considered\": [],\n  \"clarification_needed\": false,\n  \"clarification_question\": null\n}\n\nConversation history (oldest first):\n{{ $json.history.map(h => h.role + ': ' + h.content).join('\\n') }}",
+          "maxIterations": 3
+        }
+      },
       "id": "llm-reason",
-      "name": "LLM Reasoning",
-      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
-      "notes": "Main reasoning step. Given user message + memory + available skills, decide what action(s) to take. Must NOT produce raw CTI API calls. Must produce structured intent."
+      "name": "LLM — Reason & Plan",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [960, 0]
     },
     {
-      "id": "build-proposed-action",
-      "name": "Build ProposedAction (Code)",
+      "parameters": {
+        "model": "anthropic/claude-sonnet-4-5",
+        "options": { "maxTokens": 2048, "temperature": 0.3 }
+      },
+      "id": "llm-sonnet",
+      "name": "LLM: Claude Sonnet (OpenRouter)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [960, -160],
+      "credentials": { "openRouterApi": { "id": "REPLACE_WITH_YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse LLM output and detect clarification requests\nconst raw = $input.item.json.output ?? $input.item.json.text ?? '';\nlet llm_output;\ntry {\n  // Strip markdown code fences if present\n  const cleaned = raw.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```$/i, '').trim();\n  llm_output = JSON.parse(cleaned);\n} catch(e) {\n  // LLM returned prose — treat as clarification needed\n  llm_output = { clarification_needed: true, clarification_question: raw };\n}\nconst input = $('Merge Memory').first().json;\nreturn [{ json: { ...input, llm_output, needs_clarification: llm_output.clarification_needed === true } }];"
+      },
+      "id": "parse-llm-output",
+      "name": "Parse LLM Output",
       "type": "n8n-nodes-base.code",
-      "notes": "Translate LLM output into a valid ProposedAction JSON object. Validate required fields. Assign risk level based on action type and mode."
+      "typeVersion": 2,
+      "position": [1200, 0]
     },
     {
-      "id": "call-gateway",
-      "name": "Call Gateway (HTTP Request)",
-      "type": "n8n-nodes-base.httpRequest",
-      "notes": "POST ProposedAction to the YAOC2 policy gateway webhook. Include GATEWAY_WEBHOOK_SECRET in Authorization header."
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "action",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.needs_clarification }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" }, "id": "no-clarification" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "clarify",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.needs_clarification }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "needs-clarification" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "clarification-route",
+      "name": "Needs Clarification?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [1440, 0]
     },
     {
-      "id": "handle-gateway-response",
-      "name": "Handle Gateway Response (Code)",
-      "type": "n8n-nodes-base.code",
-      "notes": "Parse final_status and result_summary from gateway response. Format user-friendly reply."
-    },
-    {
-      "id": "save-memory",
-      "name": "Save Memory (Postgres)",
-      "type": "n8n-nodes-base.postgres",
-      "notes": "Persist updated conversation history and any new project memory entries."
-    },
-    {
-      "id": "reply-telegram",
-      "name": "Reply to User (Telegram)",
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.llm_output.clarification_question ?? 'Could you clarify what you mean?' }}",
+        "additionalFields": {}
+      },
+      "id": "telegram-clarify",
+      "name": "Telegram — Ask Clarification",
       "type": "n8n-nodes-base.telegram",
-      "notes": "Send formatted reply back to the user."
+      "typeVersion": 1.2,
+      "position": [1680, 160],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// See n8n/gateway/code/build-proposed-action.js\nconst input = $input.item.json;\nconst llm = input.llm_output;\nconst user = input.user;\nconst session = input.session_id;\nconst RISK_MAP = { 'read-only': 'low', 'read-write': 'medium', 'admin': 'high' };\nconst HIGH_RISK_SYSTEMS = ['shuffle','xtm','dfir-iris'];\nfunction deriveRiskLevel(mode, targetSystem) {\n  let level = RISK_MAP[mode] ?? 'medium';\n  if (HIGH_RISK_SYSTEMS.includes(targetSystem)) { const order = ['low','medium','high','critical']; const idx = order.indexOf(level); if (idx < order.length - 1) level = order[idx + 1]; }\n  return level;\n}\nfunction sanitiseParams(params) { if (!params || typeof params !== 'object') return {}; const safe = {}; for (const [k,v] of Object.entries(params)) { if (typeof v === 'string' && v.length > 500) continue; safe[k] = v; } return safe; }\nconst crypto = require('crypto');\nconst id = crypto.randomUUID();\nconst mode = llm.action?.mode ?? 'read-only';\nconst targetSystem = llm.action?.target_system ?? 'unknown';\nconst riskLevel = deriveRiskLevel(mode, targetSystem);\nconst proposedAction = {\n  id,\n  timestamp: new Date().toISOString(),\n  agent: { name: 'yaoc2-threat-analyst', version: '2026.03.1', session_id: session },\n  requester: { user_id: user.user_id, display_name: user.display_name, channel: user.channel, tenant: user.tenant ?? 'threatlabs' },\n  intent: { title: llm.intent?.title ?? 'Agent action', description: llm.intent?.description ?? '', user_prompt: input.user_message ?? '' },\n  action: { type: llm.action?.type ?? 'workflow', name: llm.action?.name, target_system: targetSystem, mode, parameters: sanitiseParams(llm.action?.parameters) },\n  risk: { level: riskLevel, reasons: llm.risk_reasons ?? [], estimated_impact: llm.estimated_impact ?? '' },\n  constraints: { must_complete_before: new Date(Date.now() + 2*60*60*1000).toISOString(), max_cost_units: 20, dry_run: false },\n  policy: { policy_set: 'default-threatlab', required_approvals: [] },\n  llm_explanation: { reasoning_summary: llm.reasoning_summary ?? '', alternatives_considered: llm.alternatives_considered ?? [] }\n};\nreturn [{ json: { ...input, proposed_action: proposedAction } }];"
+      },
+      "id": "build-proposed-action",
+      "name": "Build ProposedAction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, -160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GATEWAY_WEBHOOK_URL }}/webhook/proposed-action",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.GATEWAY_WEBHOOK_SECRET }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify($json.proposed_action) }}",
+        "options": { "timeout": 30000, "response": { "response": { "fullResponse": true } } }
+      },
+      "id": "post-to-gateway",
+      "name": "POST to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1920, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle gateway response and build user-facing reply\nconst gatewayBody = $input.item.json.body ?? $input.item.json;\nconst statusCode = $input.item.json.statusCode ?? 200;\nconst input = $('Build ProposedAction').first().json;\nlet replyText;\nif (statusCode === 200 && gatewayBody.final_status === 'executed') {\n  replyText = `✅ *Done!*\\n${gatewayBody.result_summary}`;\n} else if (statusCode === 202) {\n  replyText = `⏳ *Approval required*\\n${gatewayBody.message}\\n\\nYour request ID: \`${gatewayBody.proposed_action_id}\``;\n} else if (statusCode === 403) {\n  replyText = `🚫 *Action denied by policy*\\n${gatewayBody.message}`;\n} else if (statusCode === 400) {\n  replyText = `⚠️ *Invalid request*\\n${gatewayBody.message}`;\n} else {\n  replyText = `❌ *Gateway error (${statusCode})*\\nPlease try again or contact your analyst.`;\n}\nreturn [{ json: { ...input, gateway_response: gatewayBody, gateway_status: statusCode, reply_text: replyText } }];"
+      },
+      "id": "handle-gateway-response",
+      "name": "Handle Gateway Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, -160]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO yaoc2.conversation_memory (session_id, role, content) VALUES ($1, 'user', $2), ($1, 'assistant', $3)",
+        "additionalFields": { "queryParams": "={{ [$json.session_id, $json.user_message, $json.reply_text] }}" }
+      },
+      "id": "save-memory",
+      "name": "Save to Memory",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2400, -160],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Handle Gateway Response').first().json.chat_id }}",
+        "text": "={{ $('Handle Gateway Response').first().json.reply_text }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-reply",
+      "name": "Telegram — Reply to User",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2640, -160],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
     }
   ],
   "connections": {
-    "trigger-telegram": { "main": [[{ "node": "load-memory" }]] },
-    "load-memory": { "main": [[{ "node": "llm-reason" }]] },
-    "llm-reason": { "main": [[{ "node": "build-proposed-action" }]] },
-    "build-proposed-action": { "main": [[{ "node": "call-gateway" }]] },
-    "call-gateway": { "main": [[{ "node": "handle-gateway-response" }]] },
-    "handle-gateway-response": { "main": [[{ "node": "save-memory" }]] },
-    "save-memory": { "main": [[{ "node": "reply-telegram" }]] }
+    "Telegram — Message Trigger": { "main": [[{ "node": "Normalise Input", "type": "main", "index": 0 }]] },
+    "Normalise Input": { "main": [[{ "node": "Load Conversation Memory", "type": "main", "index": 0 }]] },
+    "Load Conversation Memory": { "main": [[{ "node": "Merge Memory", "type": "main", "index": 0 }]] },
+    "Merge Memory": { "main": [[{ "node": "LLM — Reason & Plan", "type": "main", "index": 0 }]] },
+    "LLM: Claude Sonnet (OpenRouter)": { "ai_languageModel": [[{ "node": "LLM — Reason & Plan", "type": "ai_languageModel", "index": 0 }]] },
+    "LLM — Reason & Plan": { "main": [[{ "node": "Parse LLM Output", "type": "main", "index": 0 }]] },
+    "Parse LLM Output": { "main": [[{ "node": "Needs Clarification?", "type": "main", "index": 0 }]] },
+    "Needs Clarification?": {
+      "main": [
+        [{ "node": "Build ProposedAction", "type": "main", "index": 0 }],
+        [{ "node": "Telegram — Ask Clarification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build ProposedAction": { "main": [[{ "node": "POST to Gateway", "type": "main", "index": 0 }]] },
+    "POST to Gateway": { "main": [[{ "node": "Handle Gateway Response", "type": "main", "index": 0 }]] },
+    "Handle Gateway Response": { "main": [[{ "node": "Save to Memory", "type": "main", "index": 0 }]] },
+    "Save to Memory": { "main": [[{ "node": "Telegram — Reply to User", "type": "main", "index": 0 }]] }
   },
-  "TODO": [
-    "Wire actual n8n-claw (freddy) workflows as sub-workflows for skills (web search, reminders, briefings).",
-    "Add MCP skill registry nodes.",
-    "Add proactive task / heartbeat trigger.",
-    "Replace placeholder node types with actual n8n node IDs and parameters."
-  ]
+  "active": false,
+  "tags": ["yaoc2", "brain", "openclaw", "telegram"]
 }
