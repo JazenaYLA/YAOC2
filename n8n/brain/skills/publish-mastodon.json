@@ -1,0 +1,70 @@
+{
+  "name": "[YAOC2 Skill] Publish \u2014 Mastodon",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Sub-workflow skill. Posts a toot to your Mastodon instance via the Mastodon API. Input: { text, tags[], visibility?, spoiler_text? }. Output: { status, toot_url, result_summary }. Set MASTODON_INSTANCE_URL and MASTODON_ACCESS_TOKEN in n8n env.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst text = raw.text ?? '';\nconst tags = raw.tags ?? [];\nconst visibility = raw.visibility ?? 'public';\nconst spoilerText = raw.spoiler_text ?? null;\nif (!text) throw new Error('Skill Mastodon: text is required');\nconst tagStr = tags.map(t => '#' + t.replace(/\\s+/g, '')).join(' ');\nconst status = (text + (tagStr ? '\\n\\n' + tagStr : '')).slice(0, 500);\nreturn [{ json: { status, visibility, spoiler_text: spoilerText } }];"
+      },
+      "id": "prepare-toot",
+      "name": "Prepare Toot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MASTODON_INSTANCE_URL }}/api/v1/statuses",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Authorization", "value": "={{ 'Bearer ' + $env.MASTODON_ACCESS_TOKEN }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "status", "value": "={{ $json.status }}" },
+            { "name": "visibility", "value": "={{ $json.visibility }}" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "mastodon-post",
+      "name": "Mastodon \u2014 Post Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst url = result.url ?? null;\nreturn [{ json: { status: url ? 'success' : 'failed', toot_url: url, result_summary: url ? `Posted to Mastodon: ${url}` : 'Mastodon post failed' } }];"
+      },
+      "id": "build-result",
+      "name": "Build Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0]
+    }
+  ],
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Prepare Toot", "type": "main", "index": 0 }]] },
+    "Prepare Toot": { "main": [[{ "node": "Mastodon \u2014 Post Status", "type": "main", "index": 0 }]] },
+    "Mastodon \u2014 Post Status": { "main": [[{ "node": "Build Result", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "skill", "social", "mastodon"]
+}

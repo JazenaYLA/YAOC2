@@ -1,0 +1,270 @@
+{
+  "name": "[YAOC2] Approval Callback Handler",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Receives APPROVE or DENY replies from the analyst via Telegram. Looks up the pending ProposedAction from the audit log by ID, dispatches to sandbox if approved or writes denial, updates audit log, and replies to the analyst.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "any",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram \u2014 Approval Reply Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0],
+      "webhookId": "yaoc2-approval-callback",
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.item.json.message ?? $input.item.json;\nconst text = (msg.text ?? '').trim();\nconst chatId = String(msg.chat?.id ?? msg.from?.id ?? '');\nconst fromId = String(msg.from?.id ?? '');\nconst username = msg.from?.username ?? msg.from?.first_name ?? fromId;\n// Expected format: <UUID> APPROVE or <UUID> DENY\nconst match = text.match(/^([0-9a-f-]{36})\\s+(APPROVE|DENY)$/i);\nif (!match) return [{ json: { valid: false, chat_id: chatId, raw_text: text } }];\nconst proposedActionId = match[1].toLowerCase();\nconst decision = match[2].toUpperCase();\nreturn [{ json: { valid: true, proposed_action_id: proposedActionId, decision, chat_id: chatId, approver_id: fromId, approver_name: username } }];"
+      },
+      "id": "parse-reply",
+      "name": "Parse Approval Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "valid",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "is-valid" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "invalid",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.valid }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" }, "id": "is-invalid" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "valid-route",
+      "name": "Valid Reply?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "\u26a0\ufe0f Could not parse your reply. Format: `<UUID> APPROVE` or `<UUID> DENY`",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-bad-format",
+      "name": "Telegram \u2014 Bad Format Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [720, 160],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT proposed_action_id, action_name, target_system, action_mode, risk_level, user_id, display_name, channel, tenant, proposed_action_raw FROM yaoc2.audit_log WHERE proposed_action_id = $1 AND decision = 'needs-approval' ORDER BY timestamp DESC LIMIT 1",
+        "additionalFields": { "queryParams": "={{ [$json.proposed_action_id] }}" }
+      },
+      "id": "load-pending",
+      "name": "Load Pending Action",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [720, -160],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.item.json;\nconst parsed = $('Parse Approval Reply').first().json;\nif (!row || !row.proposed_action_id) {\n  return [{ json: { found: false, ...parsed } }];\n}\nconst rawAction = typeof row.proposed_action_raw === 'string'\n  ? JSON.parse(row.proposed_action_raw)\n  : row.proposed_action_raw;\nreturn [{ json: { found: true, ...parsed, pending_row: row, proposed_action: rawAction } }];"
+      },
+      "id": "merge-pending",
+      "name": "Merge Pending Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, -160]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "approve",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $json.found }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "found" },
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "APPROVE", "operator": { "type": "string", "operation": "equals" }, "id": "is-approve" }
+                ]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "deny",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $json.found }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "found-deny" },
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "DENY", "operator": { "type": "string", "operation": "equals" }, "id": "is-deny" }
+                ]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "not-found",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.found }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" }, "id": "not-found" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "decision-route",
+      "name": "Approve / Deny / Not Found",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [1200, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.item.json;\nconst SANDBOX_MAP = {\n  'ioc_enrichment_misp_opencti': '[YAOC2 Sandbox] MISP Enrich + OpenCTI Sync',\n  'opencti_sync': '[YAOC2 Sandbox] OpenCTI Sync',\n  'case_create_thehive': '[YAOC2 Sandbox] TheHive Case Create'\n};\nconst actionName = item.proposed_action?.action?.name;\nconst sandboxWorkflow = SANDBOX_MAP[actionName];\nif (!sandboxWorkflow) throw new Error(`No sandbox mapped for action: ${actionName}`);\nreturn [{ json: { ...item, sandbox_workflow_name: sandboxWorkflow, sandbox_input: { action: item.proposed_action?.action, parameters: item.proposed_action?.action?.parameters ?? {}, proposed_action_id: item.proposed_action_id, requester: item.proposed_action?.requester } } }];"
+      },
+      "id": "map-sandbox",
+      "name": "Map to Sandbox",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, -320]
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $json.sandbox_workflow_name }}",
+        "workflowInputs": {
+          "values": [
+            { "name": "action", "value": "={{ $json.sandbox_input.action }}" },
+            { "name": "parameters", "value": "={{ $json.sandbox_input.parameters }}" },
+            { "name": "proposed_action_id", "value": "={{ $json.sandbox_input.proposed_action_id }}" },
+            { "name": "requester", "value": "={{ $json.sandbox_input.requester }}" }
+          ]
+        }
+      },
+      "id": "execute-sandbox",
+      "name": "Execute Sandbox",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [1680, -320]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE yaoc2.audit_log SET decision = 'approved', approver_id = $2, approved_at = NOW(), final_status = $3, result_summary = $4 WHERE proposed_action_id = $1 AND decision = 'needs-approval'",
+        "additionalFields": { "queryParams": "={{ [$('Merge Pending Action').first().json.proposed_action_id, $('Merge Pending Action').first().json.approver_id, $input.item.json.status ?? 'executed', $input.item.json.result_summary ?? 'Executed after approval'] }}" }
+      },
+      "id": "update-audit-approved",
+      "name": "Update Audit Log (Approved)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1920, -320],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Approval Reply').first().json.chat_id }}",
+        "text": "={{ '\u2705 *Approved and executed*\\n' + ($('Execute Sandbox').first().json.result_summary ?? 'Action completed.') }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-approved",
+      "name": "Telegram \u2014 Approved Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2160, -320],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE yaoc2.audit_log SET decision = 'denied', approver_id = $2, approved_at = NOW(), final_status = 'denied', result_summary = 'Denied by analyst via Telegram.' WHERE proposed_action_id = $1 AND decision = 'needs-approval'",
+        "additionalFields": { "queryParams": "={{ [$json.proposed_action_id, $json.approver_id] }}" }
+      },
+      "id": "update-audit-denied",
+      "name": "Update Audit Log (Denied)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1440, -160],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Approval Reply').first().json.chat_id }}",
+        "text": "={{ '\ud83d\udeab *Denied*\\nAction `' + $('Merge Pending Action').first().json.proposed_action_id + '` has been denied and logged.' }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-denied",
+      "name": "Telegram \u2014 Denied Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1680, -160],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ '\u2753 *Not found*\\nNo pending action found with ID `' + $json.proposed_action_id + '`. It may have already been processed.' }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-not-found",
+      "name": "Telegram \u2014 Not Found Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1440, 0],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    }
+  ],
+  "connections": {
+    "Telegram \u2014 Approval Reply Trigger": { "main": [[{ "node": "Parse Approval Reply", "type": "main", "index": 0 }]] },
+    "Parse Approval Reply": { "main": [[{ "node": "Valid Reply?", "type": "main", "index": 0 }]] },
+    "Valid Reply?": {
+      "main": [
+        [{ "node": "Load Pending Action", "type": "main", "index": 0 }],
+        [{ "node": "Telegram \u2014 Bad Format Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Load Pending Action": { "main": [[{ "node": "Merge Pending Action", "type": "main", "index": 0 }]] },
+    "Merge Pending Action": { "main": [[{ "node": "Approve / Deny / Not Found", "type": "main", "index": 0 }]] },
+    "Approve / Deny / Not Found": {
+      "main": [
+        [{ "node": "Map to Sandbox", "type": "main", "index": 0 }],
+        [{ "node": "Update Audit Log (Denied)", "type": "main", "index": 0 }],
+        [{ "node": "Telegram \u2014 Not Found Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Map to Sandbox": { "main": [[{ "node": "Execute Sandbox", "type": "main", "index": 0 }]] },
+    "Execute Sandbox": { "main": [[{ "node": "Update Audit Log (Approved)", "type": "main", "index": 0 }]] },
+    "Update Audit Log (Approved)": { "main": [[{ "node": "Telegram \u2014 Approved Reply", "type": "main", "index": 0 }]] },
+    "Update Audit Log (Denied)": { "main": [[{ "node": "Telegram \u2014 Denied Reply", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "approval", "telegram"]
+}

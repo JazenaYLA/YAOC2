@@ -1,0 +1,79 @@
+{
+  "name": "[YAOC2 Skill] Publish \u2014 Ghost Blog",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Sub-workflow skill. Creates a draft or published post on Ghost via the Admin API. Input: { title, html, tags[], status?, feature_image_url? }. Output: { status, post_url, result_summary }. Requires GHOST_ADMIN_URL and GHOST_ADMIN_API_KEY in n8n env.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst title = raw.title ?? '';\nconst html = raw.html ?? raw.text ?? '';\nconst tags = (raw.tags ?? []).map(t => ({ name: t }));\nconst status = raw.status ?? 'draft';\nconst featureImageUrl = raw.feature_image_url ?? null;\nif (!title) throw new Error('Skill Ghost: title is required');\nif (!html) throw new Error('Skill Ghost: html or text is required');\n// Ghost Admin API JWT\nconst [id, secret] = ($env.GHOST_ADMIN_API_KEY ?? ':').split(':');\nconst now = Math.floor(Date.now() / 1000);\nconst header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: id })).replace(/=/g,'').replace(/\\+/g,'-').replace(/\\//g,'_');\nconst payload = btoa(JSON.stringify({ iat: now, exp: now + 300, aud: '/admin/' })).replace(/=/g,'').replace(/\\+/g,'-').replace(/\\//g,'_');\n// Note: full HMAC-SHA256 signing requires the crypto helper; we pass the key parts for the HTTP node to use\nreturn [{ json: { title, html, tags, status, feature_image_url: featureImageUrl, ghost_api_id: id, ghost_api_secret: secret } }];"
+      },
+      "id": "prepare-post",
+      "name": "Prepare Post",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate Ghost Admin API JWT using Node.js crypto (available in n8n Code node)\nconst crypto = require('crypto');\nconst item = $input.first().json;\nconst id = item.ghost_api_id;\nconst secret = item.ghost_api_secret;\nconst now = Math.floor(Date.now() / 1000);\nconst headerB64 = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: id })).toString('base64url');\nconst payloadB64 = Buffer.from(JSON.stringify({ iat: now, exp: now + 300, aud: '/admin/' })).toString('base64url');\nconst signingInput = `${headerB64}.${payloadB64}`;\nconst sig = crypto.createHmac('sha256', Buffer.from(secret, 'hex')).update(signingInput).digest('base64url');\nconst jwt = `${signingInput}.${sig}`;\nreturn [{ json: { ...item, ghost_jwt: jwt } }];"
+      },
+      "id": "sign-jwt",
+      "name": "Sign Ghost JWT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GHOST_ADMIN_URL }}/ghost/api/admin/posts/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Ghost ' + $json.ghost_jwt }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ posts: [{ title: $json.title, html: $json.html, tags: $json.tags, status: $json.status, ...(($json.feature_image_url) ? { feature_image: $json.feature_image_url } : {}) }] }) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "ghost-create-post",
+      "name": "Ghost \u2014 Create Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst post = result.posts?.[0] ?? null;\nconst url = post?.url ?? null;\nreturn [{ json: { status: url ? 'success' : 'failed', post_url: url, ghost_post_id: post?.id ?? null, result_summary: url ? `Ghost post created (${post?.status}): ${url}` : 'Ghost post creation failed' } }];"
+      },
+      "id": "build-result",
+      "name": "Build Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 0]
+    }
+  ],
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Prepare Post", "type": "main", "index": 0 }]] },
+    "Prepare Post": { "main": [[{ "node": "Sign Ghost JWT", "type": "main", "index": 0 }]] },
+    "Sign Ghost JWT": { "main": [[{ "node": "Ghost \u2014 Create Post", "type": "main", "index": 0 }]] },
+    "Ghost \u2014 Create Post": { "main": [[{ "node": "Build Result", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "skill", "social", "ghost"]
+}

@@ -1,0 +1,81 @@
+{
+  "name": "[YAOC2 Skill] Publish \u2014 Bluesky",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Sub-workflow skill. Called by the brain with enriched CTI content. Authenticates to Bluesky via ATP API, posts a thread or single post, returns post URI. Input: { text, tags[], thread_parent_uri? }. Output: { status, post_uri, result_summary }.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst text = raw.text ?? '';\nconst tags = raw.tags ?? [];\nconst threadParentUri = raw.thread_parent_uri ?? null;\nif (!text) throw new Error('Skill Bluesky: text is required');\n// Bluesky post limit: 300 grapheme clusters\nconst truncated = [...text].length > 280 ? [...text].slice(0, 277).join('') + '...' : text;\n// Append hashtags if they fit\nconst tagStr = tags.map(t => '#' + t.replace(/\\s+/g, '')).join(' ');\nconst finalText = (truncated + (tagStr ? ' ' + tagStr : '')).slice(0, 300);\nreturn [{ json: { text: finalText, thread_parent_uri: threadParentUri } }];"
+      },
+      "id": "prepare-post",
+      "name": "Prepare Post Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://bsky.social/xrpc/com.atproto.server.createSession",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ identifier: $env.BLUESKY_HANDLE, password: $env.BLUESKY_APP_PASSWORD }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "bsky-auth",
+      "name": "Bluesky \u2014 Authenticate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://bsky.social/xrpc/com.atproto.repo.createRecord",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Authorization", "value": "={{ 'Bearer ' + $json.accessJwt }}" }]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ repo: $json.did, collection: 'app.bsky.feed.post', record: { '$type': 'app.bsky.feed.post', text: $('Prepare Post Text').first().json.text, createdAt: new Date().toISOString(), ...(($('Prepare Post Text').first().json.thread_parent_uri) ? { reply: { root: { uri: $('Prepare Post Text').first().json.thread_parent_uri, cid: '' }, parent: { uri: $('Prepare Post Text').first().json.thread_parent_uri, cid: '' } } } : {}) } }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "bsky-post",
+      "name": "Bluesky \u2014 Create Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst uri = result.uri ?? null;\nreturn [{ json: { status: uri ? 'success' : 'failed', post_uri: uri, result_summary: uri ? `Posted to Bluesky: ${uri}` : 'Bluesky post failed' } }];"
+      },
+      "id": "build-result",
+      "name": "Build Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 0]
+    }
+  ],
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Prepare Post Text", "type": "main", "index": 0 }]] },
+    "Prepare Post Text": { "main": [[{ "node": "Bluesky \u2014 Authenticate", "type": "main", "index": 0 }]] },
+    "Bluesky \u2014 Authenticate": { "main": [[{ "node": "Bluesky \u2014 Create Post", "type": "main", "index": 0 }]] },
+    "Bluesky \u2014 Create Post": { "main": [[{ "node": "Build Result", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "skill", "social", "bluesky"]
+}
