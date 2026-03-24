@@ -1,0 +1,137 @@
+{
+  "name": "[YAOC2] Onboarding — Capability (Runtime Guard Handler)",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Generic runtime capability onboarding handler. Called by the policy gateway Switch node when Capability Guard returns {status:'missing'}. Logs the missing config to yaoc2.audit_log, sends the operator a Telegram alert with exact missing fields and setup instructions, and optionally triggers a capability-specific onboarding sub-workflow if one is named. This is the YAOC2 equivalent of OpenClaw's 'onboard' command — but triggered at runtime when a capability is first attempted rather than at startup.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            { "name": "capability", "type": "string" },
+            { "name": "missingFields", "type": "array" },
+            { "name": "instructions", "type": "string" },
+            { "name": "onboarding_workflow", "type": "string" },
+            { "name": "requester", "type": "string" },
+            { "name": "context", "type": "string" }
+          ]
+        }
+      },
+      "id": "cap-onboard-trigger",
+      "name": "Input — Guard Failure Payload",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.item.json;\nconst ts = new Date().toISOString();\nconst missingList = (input.missingFields ?? []).join(', ');\n\nconst alertText = [
+  `\u26a0\ufe0f *YAOC2 — Capability Not Configured*`,
+  ``,
+  `*Capability:* ${input.capability ?? 'unknown'}`,
+  `*Missing:* \`${missingList}\``,
+  `*Requested by:* ${input.requester ?? 'system'}`,
+  `*Context:* ${input.context ?? 'n/a'}`,
+  ``,
+  `*What to do:*`,
+  input.instructions ?? 'Check /opt/n8n.env and restart n8n.',
+  ``,
+  `_Once configured, the next request will proceed automatically. No restart needed if using Infisical/dynamic env._`
+].join('\\n');\n\nreturn [{ json: {\n  alertText,\n  capability: input.capability,\n  missingFields: input.missingFields,\n  instructions: input.instructions,\n  onboarding_workflow: input.onboarding_workflow,\n  requester: input.requester,\n  context: input.context,\n  logged_at: ts\n} }];"
+      },
+      "id": "build-alert",
+      "name": "Build Operator Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "yaoc2",
+        "table": "audit_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_type": "capability_missing",
+            "capability": "={{ $json.capability }}",
+            "detail": "={{ JSON.stringify({ missingFields: $json.missingFields, instructions: $json.instructions, requester: $json.requester, context: $json.context }) }}",
+            "created_at": "={{ $json.logged_at }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "log-audit",
+      "name": "Log to audit_log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 0],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.APPROVAL_CHAT_ID }}",
+        "text": "={{ $('Build Operator Alert').first().json.alertText }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "alert-operator",
+      "name": "Alert Operator via Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [720, 0],
+      "credentials": { "telegramApi": { "id": "REPLACE_TELEGRAM_CREDENTIAL", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "has_onboarding",
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{
+                  "leftValue": "={{ $('Build Operator Alert').first().json.onboarding_workflow }}",
+                  "rightValue": "",
+                  "operator": { "type": "string", "operation": "notEquals" },
+                  "id": "has-wf"
+                }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "none" }
+      },
+      "id": "check-has-onboarding",
+      "name": "Has Onboarding Workflow?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [960, 0]
+    },
+    {
+      "parameters": {
+        "content": "## Runtime Capability Onboarding Handler\n\nFlow:\n1. Guard returns {status:'missing'} → policy gateway calls this workflow\n2. This workflow: logs to audit_log → alerts operator via Telegram → checks if a named onboarding sub-workflow exists\n3. If yes: executes it (e.g. '[YAOC2] Onboarding — Capability: Slack')\n4. If no: stops after alert (operator must configure manually)\n\n**Adding a new capability:**\n1. Add entry to CHECKS in yaoc2-capability-guard-comms.json\n2. Optionally create a '[YAOC2] Onboarding — Capability: <Name>' workflow\n3. Reference it in the onboarding_workflow field of the CHECKS entry\n\nNo other files need changing."
+      },
+      "id": "design-note",
+      "name": "Design Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, 300]
+    }
+  ],
+  "connections": {
+    "Input — Guard Failure Payload": { "main": [[{ "node": "Build Operator Alert", "type": "main", "index": 0 }]] },
+    "Build Operator Alert": { "main": [[{ "node": "Log to audit_log", "type": "main", "index": 0 }]] },
+    "Log to audit_log": { "main": [[{ "node": "Alert Operator via Telegram", "type": "main", "index": 0 }]] },
+    "Alert Operator via Telegram": { "main": [[{ "node": "Has Onboarding Workflow?", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "onboarding", "capability-guard"]
+}
