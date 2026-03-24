@@ -1,119 +1,152 @@
-# Antigravity — Communications Capability Guard
+# Antigravity Integration Notes — Communications Capability Guard
 
-> **Last updated:** March 2026  
-> **Applies to:** All agents (Antigravity, Copilot, manual contributors) making changes to gateway send workflows.
+This document is the **enterprise Threat Intel branch integration guide** for the
+YAOC2 communications capability guard system. It tells Antigravity (and any human
+engineer) exactly what the guard is, where it lives, what it enforces, and how to
+extend it safely for enterprise-specific channels.
+
+**Last updated:** 2026-03-24  
+**Guard version:** `2026.03.3` (9-capability registry)
 
 ---
 
-## Purpose
+## What the Guard Does
 
-The Capability Guard is a pre-flight check that runs **before any outbound communication node** (Telegram send, WhatsApp send, etc.) in the Policy Gateway. It prevents silent failures when environment variables or credentials are absent by returning a structured `{status, missingFields, instructions}` response that can be logged to `yaoc2.audit_log` and surfaced as an operator alert.
+Before any YAOC2 workflow sends a message or calls an LLM, it calls
+`[YAOC2] Capability Guard — Communications` via Execute Workflow. The guard:
+
+1. Checks that all required env vars for the requested capability are present and non-empty.
+2. Returns `{status: 'ok'}` if everything is configured.
+3. Returns `{status: 'missing', missingFields: [], instructions: '', onboarding_workflow: ''}` if anything is absent.
+4. **Never throws an error.** A missing capability is a handled state, not a failure.
+
+On `missing`, the calling workflow routes to `[YAOC2] Onboarding — Capability (Runtime Guard Handler)`, which:
+- Logs to `yaoc2.audit_log` with `event_type: capability_missing`
+- Sends the operator a Telegram alert with exact missing vars and setup instructions
+- Optionally triggers a named onboarding sub-workflow for that capability
 
 ---
 
-## Workflow Location
+## File Locations
 
-| Workflow | File | Call method |
+| File | Purpose |
+|---|---|
+| `n8n/gateway/workflows/yaoc2-capability-guard-comms.json` | Guard — CHECKS registry + guard logic |
+| `n8n/gateway/workflows/yaoc2-onboarding-capability.json` | Runtime handler for `status:missing` |
+| `n8n/gateway/workflows/yaoc2-onboarding-router.json` | User onboarding router (first-contact detection) |
+| `n8n/gateway/workflows/yaoc2-onboarding-telegram.json` | New Telegram user profile creation |
+| `n8n/gateway/workflows/yaoc2-onboarding-whatsapp.json` | New WhatsApp user profile creation |
+| `docs/CAPABILITY_ONBOARDING.md` | Full pattern documentation + CHECKS table |
+
+---
+
+## Current CHECKS Registry (v2026.03.3)
+
+### Communications Channels
+
+| Capability key | Required env vars | Alert channel |
 |---|---|---|
-| `[YAOC2] Capability Guard — Communications` | `n8n/gateway/workflows/yaoc2-capability-guard-comms.json` | Execute Workflow (synchronous, same owner) |
+| `telegram` | `TELEGRAM_BOT_TOKEN`, `APPROVAL_CHAT_ID` | — (this IS the alert channel; must always be set) |
+| `whatsapp` | `EVOLUTION_API_URL`, `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE_NAME`, `WHATSAPP_PHONE` | Telegram |
+| `slack` | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_DEFAULT_CHANNEL` | Telegram |
+
+### Google Services
+
+| Capability key | Required env vars | Notes |
+|---|---|---|
+| `google_ai` | `GOOGLE_AI_API_KEY` | Gemini models. Key from aistudio.google.com. |
+| `gmail` | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth tokens stored in n8n credential store, not env. |
+| `google_calendar` | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Same OAuth app as Gmail; enable Calendar API separately. |
+
+### LLM Providers
+
+| Capability key | Required env vars | Covers |
+|---|---|---|
+| `openai-compat` | `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_KEY` | OpenAI, Groq, Mistral, OpenRouter, Ollama, LM Studio, LiteLLM, vLLM, Claude via proxy |
+| `deepseek` | `DEEPSEEK_API_KEY` | DeepSeek native. Can also route via `openai-compat`. |
+| `anthropic_direct` | `ANTHROPIC_API_KEY` | Claude native API. Use `openai-compat` for Claude via proxy. |
 
 ---
 
-## Call Contract
+## Mandatory Antigravity Requirements
 
-### Input
+### On initial deployment (run from ANTIGRAVITY_RECONFIGURE.md Step 6b)
 
-```json
-{ "capability": "telegram" }
-```
+1. Import `yaoc2-onboarding-capability.json` **before** `yaoc2-capability-guard-comms.json`.
+2. Import `yaoc2-capability-guard-comms.json` **before** `yaoc2-policy-gateway.json` is activated.
+3. Verify `TELEGRAM_BOT_TOKEN` and `APPROVAL_CHAT_ID` are set in the gateway `.env` —
+   Telegram is the fallback alert channel and **must always be configured**.
+4. For each capability in scope at launch, verify its env vars are present (see table above).
 
-Valid `capability` values: `telegram`, `whatsapp`, `deepseek`
+### On reconfiguration
 
-### Output — Success
+1. Do **not** remove the Execute Workflow nodes in `yaoc2-policy-gateway` that call the guard.
+2. Do **not** bypass the guard by hard-coding credentials or skipping the guard call.
+3. Do **not** modify the guard logic block (below the `CHECKS` object in the Code node).
+4. If a capability env var changes (e.g., new `TELEGRAM_BOT_TOKEN`), update `/opt/n8n.env`
+   and restart n8n (or reload env if using Infisical dynamic injection). No workflow changes needed.
+5. If a capability is deliberately removed from scope, remove its env vars from `.env` —
+   the guard will automatically return `missing` for it and alert you, which is the correct
+   behavior and confirms the removal propagated.
 
-```json
-{ "status": "ok", "capability": "telegram", "checkedFields": ["TELEGRAM_BOT_TOKEN", "APPROVAL_CHAT_ID"] }
-```
+---
 
-### Output — Failure
+## Enterprise Extension Rules
 
-```json
-{
-  "status": "missing",
-  "missingFields": ["TELEGRAM_BOT_TOKEN"],
-  "instructions": "Set TELEGRAM_BOT_TOKEN and APPROVAL_CHAT_ID in your n8n environment, and ensure the Telegram Bot credential is configured."
+The enterprise Threat Intel branch may need additional capabilities not in the base registry
+(e.g., Microsoft Teams, PagerDuty, Jira, email SMTP, custom threat intel feeds).
+
+**Rule: Add to CHECKS only. Never modify guard logic.**
+
+To add a new capability:
+
+```javascript
+// In yaoc2-capability-guard-comms.json, CHECKS object only:
+teams: {
+  env: ['TEAMS_WEBHOOK_URL'],
+  instructions: 'Create an Incoming Webhook connector in your Teams channel. Set TEAMS_WEBHOOK_URL in /opt/n8n.env.',
+  onboarding_workflow: '[YAOC2] Onboarding — Capability: Teams'
 }
 ```
 
----
+Then optionally create `yaoc2-onboarding-capability-teams.json` following the existing
+onboarding workflow pattern. No other files need changing.
 
-## Required Environment Variables Per Channel
-
-### Telegram
-
-| Variable | Purpose |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Auth token for the Telegram Bot API |
-| `APPROVAL_CHAT_ID` | Chat ID where approval requests and operator alerts are sent |
-
-### WhatsApp (Evolution API)
-
-| Variable | Purpose |
-|---|---|
-| `EVOLUTION_API_URL` | Base URL of the Evolution API instance (e.g. `http://192.168.101.169:8080`) |
-| `EVOLUTION_API_KEY` | Global API key for Evolution API auth |
-| `EVOLUTION_INSTANCE_NAME` | The Evolution instance name for this n8n stack (e.g. `yaoc2`) |
-| `WHATSAPP_PHONE` | The WhatsApp phone number tied to the Evolution instance |
-
-### DeepSeek
-
-| Variable | Purpose |
-|---|---|
-| `DEEPSEEK_API_KEY` | API key for DeepSeek inference (used by Brain AI Agent nodes) |
+**Do not fork the guard workflow.** Enterprise branches should extend the `CHECKS` object
+in the shared `yaoc2-capability-guard-comms.json` and submit the addition upstream so all
+branches benefit from the new capability definition.
 
 ---
 
-## Integration Pattern in Policy Gateway
+## Boundary with n8n-unified
 
-The guard is inserted in the `needs-approval` branch of the Decision Route, immediately before the Telegram send node:
+The capability guard lives entirely in the **YAOC2 gateway n8n instance**. It does not run
+in `n8n-unified` (the multi-channel router for direct chat use cases).
 
-```
-Decision Route (needs-approval)
-  └─▶ Capability Guard — Telegram        [Execute Workflow]
-        ├─▶ ok      → Telegram — Request Approval  [Telegram node]
-        │               └─▶ Respond 202 Pending
-        └─▶ missing → Log Guard Failure            [Postgres insert]
-                        └─▶ Telegram — Operator Alert (Guard Failure)
+| System | Guard? | Notes |
+|---|---|---|
+| `yaoc2-gateway` n8n | ✅ Yes — mandatory | All outbound sends and LLM calls go through guard |
+| `n8n-unified` | ❌ No | Telegram + WhatsApp are already wired there; guard pattern not yet applied |
+
+For enterprise deployments where `n8n-unified` is also used for agentic workflows,
+consider applying the same guard pattern to the `multi-channel-router` workflow. The
+CHECKS registry and onboarding handler are reusable as-is — just import the two
+workflows into the `n8n-unified` instance and call the guard before outbound nodes.
+
+---
+
+## Audit Trail
+
+Every `status:missing` event is written to `yaoc2.audit_log`:
+
+```sql
+SELECT event_type, capability, detail, created_at
+FROM yaoc2.audit_log
+WHERE event_type = 'capability_missing'
+ORDER BY created_at DESC
+LIMIT 20;
 ```
 
-The guard failure path still attempts a Telegram send (for the operator alert) — this is intentional. If Telegram is genuinely broken, that second send will also fail, but the audit log entry will have been written first, preserving the event record regardless.
-
----
-
-## Antigravity Responsibilities
-
-When modifying or extending the gateway, agents **must**:
-
-1. **Preserve guard call sites** — never remove or bypass the `Capability Guard — Telegram` Execute Workflow node from the approval branch.
-2. **Add new capability cases** for future channels — when adding Slack, Teams, email, or any new outbound channel:
-   - Add the channel key and its `env` array + `instructions` string to the `CHECKS` object in `yaoc2-capability-guard-comms.json`.
-   - Insert a corresponding guard call + Switch node before the new send node in the affected workflow.
-   - Update this document with the new channel's required env vars.
-3. **Never hard-code tokens** — all secrets must reference `$env.VARIABLE_NAME` and be seeded via `update-secrets.sh` from Infisical.
-4. **Always write to `yaoc2.audit_log`** on guard failure — the log entry is the source of truth for debugging missing credentials in production.
-
----
-
-## Testing the Guard
-
-To test the guard in isolation without running the full gateway:
-
-1. Open `[YAOC2] Capability Guard — Communications` in the n8n UI.
-2. Click **Test workflow**.
-3. Pass `{ "capability": "telegram" }` as input.
-4. Confirm the response is `{"status": "ok", ...}` if env vars are set, or `{"status": "missing", ...}` if any are absent.
-
-To simulate a guard failure end-to-end:
-1. Temporarily unset `TELEGRAM_BOT_TOKEN` in the n8n environment.
-2. Trigger a `needs-approval` decision through the Policy Gateway.
-3. Confirm the audit log receives a `capability-missing` row and the operator alert fires (or fails gracefully if Telegram itself is down).
+This gives the Threat Intel team a retrospective view of which capabilities were
+attempted but unconfigured, who requested them, and when — useful for both
+capacity planning and security audit.
