@@ -95,7 +95,7 @@ Could not locate the bindings file. Tried:
 # Enter the LXC from Proxmox host
 pct enter 104
 
-# Ensure build tools are present (already installed on this host)
+# Ensure build tools are present
 apt install -y build-essential python3 make g++
 
 # Rebuild sqlite3 native bindings for the current Node version
@@ -123,3 +123,85 @@ cd /root/.n8n/nodes/node_modules/n8n-nodes-sqlite3
 npm rebuild sqlite3 --build-from-source
 systemctl restart n8n
 ```
+
+---
+
+### Telegram Trigger Webhook Error — `Failed to resolve host`
+
+**Symptom:** Telegram Trigger node in n8n throws:
+```
+Bad Request: bad webhook: Failed to resolve host: Name or service not known
+```
+
+**Root cause:** n8n's `WEBHOOK_URL` is set to an internal-only hostname (e.g. `n8n.lab.threatresearcher.net`) that is not publicly resolvable by Telegram's servers. Both Telegram and WhatsApp Cloud integrations require a **public HTTPS URL** that Telegram/Meta can reach to deliver webhook events.
+
+**Fix — Option A: Cloudflare Tunnel (recommended, permanent)**
+
+Set up a Cloudflared LXC or add a tunnel to your existing setup. Once you have a public domain routing to n8n, update `/opt/n8n.env` (or wherever the Proxmox helper script stores n8n env vars):
+
+```bash
+# In /opt/n8n.env (adjust path if your setup uses a different file)
+WEBHOOK_URL=https://n8n.yourdomain.com
+WEBHOOK_TUNNEL_URL=https://n8n.yourdomain.com
+```
+
+Then restart n8n and re-activate the Telegram trigger workflow:
+
+```bash
+systemctl restart n8n
+```
+
+**Fix — Option B: ngrok (temporary, until Cloudflare tunnel is ready)**
+
+Install ngrok inside CT 104 (the n8n LXC) and run a tunnel to port 5678:
+
+```bash
+# Install ngrok (Debian)
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | tee /etc/apt/sources.list.d/ngrok.list
+apt update && apt install -y ngrok
+
+# Authenticate (get token from https://dashboard.ngrok.com)
+ngrok config add-authtoken YOUR_NGROK_TOKEN
+
+# Start tunnel (note the HTTPS URL it gives you, e.g. https://abcd-1234.ngrok-free.app)
+ngrok http 5678
+```
+
+Set the ngrok URL in n8n and restart:
+
+```bash
+export WEBHOOK_URL=https://abcd-1234.ngrok-free.app
+export WEBHOOK_TUNNEL_URL=https://abcd-1234.ngrok-free.app
+systemctl restart n8n
+```
+
+**Make ngrok persistent** (optional, so it survives reboots):
+
+```bash
+cat >/etc/systemd/system/ngrok.service <<'EOF'
+[Unit]
+Description=ngrok tunnel for n8n
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ngrok http 5678
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ngrok
+```
+
+> ⚠️ **ngrok free tier** gives a random URL that changes on every restart. You must update `WEBHOOK_URL` and restart n8n each time. The paid tier supports static domains. For production, migrate to Cloudflare Tunnel.
+
+**After any webhook URL change:**
+1. In n8n UI — deactivate and re-activate the Telegram trigger workflow so n8n re-registers the webhook with Telegram.
+2. Verify from an external machine: `curl -I https://<your-public-url>/rest/webhooks/receptionist` — should return an HTTP response (not a DNS error).
+
+**Applies to:** Telegram Trigger, WhatsApp Business Cloud Trigger, and any other n8n webhook-based integration requiring a public HTTPS callback URL.
