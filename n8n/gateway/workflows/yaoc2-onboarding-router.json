@@ -1,0 +1,59 @@
+{
+  "name": "[YAOC2] Onboarding Router — First Contact Detection",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Shared sub-workflow called by all channel ingress workflows before forwarding to the policy gateway. Checks yaoc2.user_profiles for the incoming user_id+channel pair. If not found, returns {action: 'onboard'} so the caller routes to the channel-specific onboarding workflow. If found, returns {action: 'proceed', profile} so the caller routes normally to the brain.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            { "name": "user_id", "type": "string" },
+            { "name": "channel", "type": "string" },
+            { "name": "display_name", "type": "string" }
+          ]
+        }
+      },
+      "id": "router-trigger",
+      "name": "Input — user_id + channel",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, user_id, channel, display_name, role, tenant, onboarded_at, policy_set FROM yaoc2.user_profiles WHERE user_id = $1 AND channel = $2 LIMIT 1",
+        "additionalFields": { "queryParams": "={{ [$json.user_id, $json.channel] }}" }
+      },
+      "id": "lookup-profile",
+      "name": "Lookup User Profile",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [240, 0],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Input — user_id + channel').first().json;\nconst rows = $input.all();\nconst profile = rows.length > 0 && rows[0].json.user_id ? rows[0].json : null;\n\nif (profile) {\n  return [{ json: { action: 'proceed', profile } }];\n} else {\n  return [{ json: {\n    action: 'onboard',\n    user_id: input.user_id,\n    channel: input.channel,\n    display_name: input.display_name ?? 'Unknown'\n  } }];\n}"
+      },
+      "id": "check-profile",
+      "name": "Profile Exists?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 0]
+    }
+  ],
+  "connections": {
+    "Input — user_id + channel": { "main": [[{ "node": "Lookup User Profile", "type": "main", "index": 0 }]] },
+    "Lookup User Profile": { "main": [[{ "node": "Profile Exists?", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "onboarding", "router"]
+}

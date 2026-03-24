@@ -1,0 +1,121 @@
+{
+  "name": "[YAOC2] Onboarding — WhatsApp",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Handles first-contact WhatsApp users who are not yet in yaoc2.user_profiles. Triggered by the WhatsApp ingress when the Onboarding Router returns {action:'onboard'}. Sends a plain-text welcome (no Markdown — WhatsApp renders it differently), writes the user profile to Postgres, and confirms onboarding. Plain text enforced throughout since Evolution API/WhatsApp does not reliably render Telegram-style Markdown.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            { "name": "user_id", "type": "string" },
+            { "name": "channel", "type": "string" },
+            { "name": "display_name", "type": "string" },
+            { "name": "from_phone", "type": "string" },
+            { "name": "instance_name", "type": "string" },
+            { "name": "original_text", "type": "string" }
+          ]
+        }
+      },
+      "id": "onboard-wa-trigger",
+      "name": "Input — First Contact WhatsApp",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EVOLUTION_API_URL }}/message/sendText/{{ $json.instance_name }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $json.from_phone, text: 'Welcome to YAOC2 - Threat Intel Assistant\\n\\nI do not have you in my records yet. Setting you up now.\\n\\nYour profile:\\n- Name: ' + $json.display_name + '\\n- Channel: WhatsApp\\n- Default role: analyst\\n- Default tenant: default\\n\\nReply confirm to finish. Or reply role:<your role> or tenant:<your org> to customise.' }) }}",
+        "options": {}
+      },
+      "id": "send-welcome-wa",
+      "name": "Send Welcome (Plain Text)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Input — First Contact WhatsApp').first().json;\nconst text = (input.original_text ?? '').toLowerCase().trim();\n\nlet role = 'analyst';\nlet tenant = 'default';\n\nconst roleMatch = text.match(/role:([\\w-]+)/);\nconst tenantMatch = text.match(/tenant:([\\w-]+)/);\nif (roleMatch) role = roleMatch[1];\nif (tenantMatch) tenant = tenantMatch[1];\n\nconst VALID_ROLES = ['analyst', 'operator', 'read-only', 'admin'];\nif (!VALID_ROLES.includes(role)) role = 'analyst';\n\nreturn [{ json: {\n  user_id: input.user_id,\n  channel: 'whatsapp',\n  display_name: input.display_name,\n  from_phone: input.from_phone,\n  instance_name: input.instance_name,\n  role,\n  tenant,\n  policy_set: 'default',\n  onboarded_at: new Date().toISOString()\n} }];"
+      },
+      "id": "resolve-profile-wa",
+      "name": "Resolve Role & Tenant",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "yaoc2",
+        "table": "user_profiles",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "user_id": "={{ $json.user_id }}",
+            "channel": "={{ $json.channel }}",
+            "display_name": "={{ $json.display_name }}",
+            "role": "={{ $json.role }}",
+            "tenant": "={{ $json.tenant }}",
+            "policy_set": "={{ $json.policy_set }}",
+            "onboarded_at": "={{ $json.onboarded_at }}"
+          }
+        },
+        "options": { "onConflict": "ignore" }
+      },
+      "id": "write-profile-wa",
+      "name": "Write User Profile",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [720, 0],
+      "credentials": { "postgres": { "id": "REPLACE_INFRA_POSTGRES_CREDENTIAL", "name": "infra-postgres" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EVOLUTION_API_URL }}/message/sendText/{{ $('Resolve Role & Tenant').first().json.instance_name }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $('Resolve Role & Tenant').first().json.from_phone, text: 'Onboarding complete.\\n\\nYou are now registered as:\\n- Role: ' + $('Resolve Role & Tenant').first().json.role + '\\n- Tenant: ' + $('Resolve Role & Tenant').first().json.tenant + '\\n- Policy set: default\\n\\nSend your first threat intel query or type help for a list of capabilities.' }) }}",
+        "options": {}
+      },
+      "id": "send-confirmed-wa",
+      "name": "Send Confirmation (Plain Text)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 0]
+    }
+  ],
+  "connections": {
+    "Input — First Contact WhatsApp": { "main": [[{ "node": "Send Welcome (Plain Text)", "type": "main", "index": 0 }]] },
+    "Send Welcome (Plain Text)": { "main": [[{ "node": "Resolve Role & Tenant", "type": "main", "index": 0 }]] },
+    "Resolve Role & Tenant": { "main": [[{ "node": "Write User Profile", "type": "main", "index": 0 }]] },
+    "Write User Profile": { "main": [[{ "node": "Send Confirmation (Plain Text)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "onboarding", "whatsapp"]
+}
