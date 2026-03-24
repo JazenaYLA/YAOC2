@@ -1,0 +1,43 @@
+{
+  "name": "[YAOC2] Capability Guard — Communications",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "Pre-flight guard for all outbound communications. Checks that required env vars and credentials exist for the requested channel (telegram, whatsapp, deepseek). Returns {status:'ok'} if all checks pass, or {status:'missing', missingFields:[], instructions:''} if anything is absent. Called via Execute Workflow before any send node in the policy gateway.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            { "name": "capability", "type": "string" }
+          ]
+        }
+      },
+      "id": "guard-input",
+      "name": "Input — capability",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const CHECKS = {\n  telegram: {\n    env: ['TELEGRAM_BOT_TOKEN', 'APPROVAL_CHAT_ID'],\n    instructions: 'Set TELEGRAM_BOT_TOKEN and APPROVAL_CHAT_ID in your n8n environment, and ensure the Telegram Bot credential is configured.'\n  },\n  whatsapp: {\n    env: ['EVOLUTION_API_URL', 'EVOLUTION_API_KEY', 'EVOLUTION_INSTANCE_NAME', 'WHATSAPP_PHONE'],\n    instructions: 'Set EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE_NAME, and WHATSAPP_PHONE in your n8n environment.'\n  },\n  deepseek: {\n    env: ['DEEPSEEK_API_KEY'],\n    instructions: 'Set DEEPSEEK_API_KEY in your n8n environment and configure the DeepSeek credential.'\n  }\n};\n\nconst capability = $input.item.json.capability;\nif (!capability) {\n  return [{ json: { status: 'missing', missingFields: ['capability'], instructions: 'Pass a capability string (telegram|whatsapp|deepseek) as input.' } }];\n}\n\nconst check = CHECKS[capability];\nif (!check) {\n  return [{ json: { status: 'missing', missingFields: ['capability'], instructions: `Unknown capability '${capability}'. Valid values: ${Object.keys(CHECKS).join(', ')}.` } }];\n}\n\nconst missingFields = [];\nfor (const envVar of check.env) {\n  const val = $env[envVar];\n  if (!val || val.trim() === '') {\n    missingFields.push(envVar);\n  }\n}\n\nif (missingFields.length > 0) {\n  return [{ json: { status: 'missing', missingFields, instructions: check.instructions } }];\n}\n\nreturn [{ json: { status: 'ok', capability, checkedFields: check.env } }];"
+      },
+      "id": "check-env",
+      "name": "Check Env Vars",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    }
+  ],
+  "connections": {
+    "Input — capability": { "main": [[{ "node": "Check Env Vars", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "guard", "communications"]
+}

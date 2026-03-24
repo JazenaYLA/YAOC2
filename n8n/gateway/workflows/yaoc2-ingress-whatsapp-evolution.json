@@ -1,0 +1,155 @@
+{
+  "name": "[YAOC2] Ingress — WhatsApp (Evolution API)",
+  "_yaoc2_version": "2026.03.1",
+  "_doc": "WhatsApp ingress receptionist. Receives webhook from Evolution API at /webhook/whatsapp-yaoc2, normalizes the payload into a YAOC2 ProposedAction envelope, forwards to the Policy Gateway, and replies to the sender via Evolution API. Mirrors the Telegram receptionist pattern.",
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "any",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-yaoc2",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-whatsapp",
+      "name": "Webhook — WhatsApp Evolution",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "yaoc2-whatsapp-evolution"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize Evolution API v2 message payload into YAOC2 ProposedAction\nconst body = $input.item.json.body ?? $input.item.json;\n\n// Evolution API v2 message structure\nconst msg = body.data?.message ?? body.message ?? {};\nconst key = body.data?.key ?? body.key ?? {};\nconst pushName = body.data?.pushName ?? body.pushName ?? 'Unknown';\nconst instance = body.instance ?? $env.EVOLUTION_INSTANCE_NAME ?? 'default';\n\nconst fromPhone = key.remoteJid?.replace('@s.whatsapp.net','').replace('@g.us','') ?? 'unknown';\nconst messageText = msg.conversation ?? msg.extendedTextMessage?.text ?? msg.text ?? '';\nconst messageId = key.id ?? crypto.randomUUID();\n\nif (!messageText || key.fromMe) {\n  // Skip outbound messages and empty payloads\n  return [{ json: { _skip: true, reason: key.fromMe ? 'outbound' : 'empty_message' } }];\n}\n\nconst proposedAction = {\n  id: crypto.randomUUID(),\n  timestamp: new Date().toISOString(),\n  agent: 'yaoc2-gateway',\n  requester: {\n    user_id: fromPhone,\n    display_name: pushName,\n    channel: 'whatsapp',\n    tenant: 'default'\n  },\n  intent: {\n    title: 'WhatsApp user message',\n    description: messageText\n  },\n  action: {\n    type: 'workflow',\n    name: 'handle_whatsapp_message',\n    target_system: 'yaoc2-brain',\n    mode: 'read-write',\n    parameters: {\n      message_text: messageText,\n      from_phone: fromPhone,\n      message_id: messageId,\n      instance_name: instance\n    }\n  },\n  risk: { level: 'low' },\n  policy: { policy_set: 'default' }\n};\n\nreturn [{ json: { proposedAction, fromPhone, instance, messageId } }];"
+      },
+      "id": "normalize-whatsapp",
+      "name": "Normalize WhatsApp Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "forward",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "false" }, "id": "not-skipped" }]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "skip",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json._skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "is-skipped" }]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "skip-route",
+      "name": "Skip Outbound?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ JSON.stringify({ status: 'skipped' }) }",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-skip",
+      "name": "Respond 200 Skip",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [720, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.GATEWAY_WEBHOOK_URL }}/webhook/proposed-action",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-gateway-secret", "value": "={{ $env.GATEWAY_WEBHOOK_SECRET }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "body", "value": "={{ JSON.stringify($json.proposedAction) }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "call-policy-gateway",
+      "name": "Call Policy Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, -160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EVOLUTION_API_URL }}/message/sendText/{{ $('Normalize WhatsApp Payload').first().json.instance }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $('Normalize WhatsApp Payload').first().json.fromPhone, text: $input.item.json.result_summary ?? $input.item.json.message ?? 'Your request has been processed.' }) }}",
+        "options": {}
+      },
+      "id": "reply-whatsapp",
+      "name": "Reply via Evolution API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, -160]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ JSON.stringify({ status: 'ok' }) }",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1200, -160]
+    }
+  ],
+  "connections": {
+    "Webhook — WhatsApp Evolution": { "main": [[{ "node": "Normalize WhatsApp Payload", "type": "main", "index": 0 }]] },
+    "Normalize WhatsApp Payload": { "main": [[{ "node": "Skip Outbound?", "type": "main", "index": 0 }]] },
+    "Skip Outbound?": {
+      "main": [
+        [{ "node": "Call Policy Gateway", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 Skip", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Policy Gateway": { "main": [[{ "node": "Reply via Evolution API", "type": "main", "index": 0 }]] },
+    "Reply via Evolution API": { "main": [[{ "node": "Respond 200 OK", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "tags": ["yaoc2", "gateway", "ingress", "whatsapp", "evolution"]
+}
