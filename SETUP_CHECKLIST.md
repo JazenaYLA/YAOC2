@@ -1,6 +1,6 @@
 # Setup Checklist — YAOC2
 
-> **Last updated:** 2026-03-19  
+> **Last updated:** 2026-03-24  
 > **Antigravity shortcut:** See `docs/ANTIGRAVITY_RECONFIGURE.md` for fully automated deployment.  
 > **n8n platform checklist:** See [`n8n-ecosystem-unified/SETUP_CHECKLIST.md`](https://github.com/JazenaYLA/n8n-ecosystem-unified/blob/main/SETUP_CHECKLIST.md)
 
@@ -70,3 +70,56 @@
 
 Tell Antigravity:
 > *"Follow `docs/ANTIGRAVITY_RECONFIGURE.md` in the YAOC2 repo. Deploy the full YAOC2 stack: upgrade postgres, run migrations, deploy gateway Dockge stack, configure n8n LXC, import all workflows in correct order, activate, and run smoke test. Report back with all URLs and workflow IDs."*
+
+---
+
+## 🛠️ Troubleshooting
+
+### sqlite3 Native Bindings Error (n8n LXC — Proxmox Helper Script Install)
+
+**Symptom:** Workflow nodes (AI Agent, SQLite community node) throw:
+```
+Could not locate the bindings file. Tried:
+→ /usr/lib/node_modules/n8n/node_modules/sqlite3/build/Release/node_sqlite3.node
+...
+→ /usr/lib/node_modules/n8n/node_modules/sqlite3/compiled/24.14.0/linux/x64/node_sqlite3.node
+```
+
+**Root cause:** The Proxmox helper script installs n8n globally under Node 24 (ABI 137), but `sqlite3` ships no prebuilt binary for that ABI. The native `.node` binding must be compiled from source.
+
+**Confirmed environment:** Node v24.14.0 · n8n v2.12.3 · Debian LXC (lxc-n8n, CT 104)
+
+**Fix (one-time, run inside the n8n LXC):**
+
+```bash
+# Enter the LXC from Proxmox host
+pct enter 104
+
+# Ensure build tools are present (already installed on this host)
+apt install -y build-essential python3 make g++
+
+# Rebuild sqlite3 native bindings for the current Node version
+cd /usr/lib/node_modules/n8n
+npm rebuild sqlite3 --build-from-source
+
+# Restart n8n
+systemctl restart n8n
+
+# Verify
+systemctl status n8n
+```
+
+**Expected output from rebuild:**
+```
+rebuilt dependencies successfully
+```
+
+> ⚠️ **After every n8n major version upgrade**, re-run `npm rebuild sqlite3 --build-from-source` if Node version changes, as the ABI will differ and the compiled binary will be stale.
+
+**If using the community `n8n-nodes-sqlite3` package**, also rebuild in the community node directory:
+
+```bash
+cd /root/.n8n/nodes/node_modules/n8n-nodes-sqlite3
+npm rebuild sqlite3 --build-from-source
+systemctl restart n8n
+```
