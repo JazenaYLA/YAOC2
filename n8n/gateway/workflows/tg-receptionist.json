@@ -1,0 +1,59 @@
+{
+  "name": "YAOC2 Telegram Receptionist",
+  "_fix": "Body forwarding was empty. Now forwards full Telegram payload with source tag. Credential ID preserved from live instance.",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "tg-trigger-id",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [112, 208],
+      "webhookId": "62b733ec-d504-4701-a675-16645871e72a",
+      "credentials": {
+        "telegramApi": {
+          "id": "PEBibW77iTJCpA8B",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n.lab.threatresearcher.net:5678/webhook/yaoc2-intelligence-v1",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{
+            "name": "X-Gateway-Secret",
+            "value": "={{ $env.GATEWAY_WEBHOOK_SECRET }}"
+          }, {
+            "name": "Content-Type",
+            "value": "application/json"
+          }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: 'telegram', raw: $input.first().json }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "tg-forward-id",
+      "name": "Forward to Brain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, 208]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": { "main": [[{ "node": "Forward to Brain", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": { "executionOrder": "v1", "binaryMode": "separate" },
+  "versionId": "1c12c0a0-ab45-4f81-b950-39f327c33c55",
+  "meta": { "templateCredsSetupCompleted": true, "instanceId": "c8a2709b949a2d6e46ab3c68e4e965bc396c0a55d9206e4fa8ee9927c92b07c8" },
+  "id": "vT0pAS9WDfPD40q5",
+  "tags": []
+}

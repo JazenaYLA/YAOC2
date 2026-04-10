@@ -1,0 +1,142 @@
+{
+  "name": "[YAOC2 Sandbox] TheHive Case Create",
+  "_fix": "Fixed all empty bodyParameters. Fixed TheHive Add Observable URL expression (was JS template literal, not n8n expression). Observables now sent as bulk array.",
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst params = raw.parameters ?? {};\nconst title = params.title ?? params.case_title ?? null;\nconst description = params.description ?? params.summary ?? 'Created by YAOC2 agent.';\nconst severity = params.severity ?? 2;\nconst tlp = params.tlp ?? 2;\nconst tags = params.tags ?? ['yaoc2', 'automated'];\nconst observables = params.observables ?? [];\nconst tasks = params.tasks ?? [];\nif (!title) throw new Error('Sandbox: parameters.title or parameters.case_title is required');\nconst proposedActionId = raw.proposed_action_id ?? 'unknown';\nreturn [{ json: { title, description, severity, tlp, tags, observables, tasks, proposed_action_id: proposedActionId, requester: raw.requester } }];"
+      },
+      "id": "normalise-input",
+      "name": "Normalise Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.THEHIVE_URL }}/api/case",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.THEHIVE_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: $json.title, description: $json.description, severity: $json.severity, tlp: $json.tlp, tags: $json.tags, tasks: $json.tasks.map(t => ({ title: t.title ?? t, status: 'Waiting' })) }) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "thehive-create-case",
+      "name": "TheHive — Create Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const hive = $input.item.json;\nconst input = $('Normalise Input').first().json;\nconst caseId = hive._id ?? hive.id ?? null;\nconst caseNumber = hive.caseId ?? hive.number ?? null;\nif (!caseId) throw new Error('TheHive case creation failed: ' + JSON.stringify(hive));\nreturn [{ json: { ...input, case_id: caseId, case_number: caseNumber, case_url: $env.THEHIVE_URL + '/cases/' + caseId + '/details' } }];"
+      },
+      "id": "parse-case",
+      "name": "Parse Case ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.observables.length > 0 }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "obs-check" }]
+              },
+              "renameOutput": true, "outputKey": "has-observables"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.observables.length === 0 }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "no-obs-check" }]
+              },
+              "renameOutput": true, "outputKey": "no-observables"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "observables-route",
+      "name": "Has Observables?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [960, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.THEHIVE_URL + '/api/case/' + $json.case_id + '/artifact' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.THEHIVE_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.observables.map(o => ({ dataType: o.type ?? o.dataType ?? 'other', data: o.value ?? o.data, message: o.message ?? '', tlp: o.tlp ?? $json.tlp ?? 2, ioc: o.ioc ?? true, sighted: o.sighted ?? false }))) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "thehive-add-observable",
+      "name": "TheHive — Add Observable",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, -128]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Parse Case ID').first().json;\nreturn [{ json: {\n  status: 'success',\n  result_summary: `TheHive case #${input.case_number} created: ${input.title}. URL: ${input.case_url}`,\n  raw_result_ref: input.case_url,\n  case_id: input.case_id,\n  case_number: input.case_number,\n  case_url: input.case_url,\n  proposed_action_id: input.proposed_action_id\n} }];"
+      },
+      "id": "build-result",
+      "name": "Build Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 0]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Normalise Input", "type": "main", "index": 0 }]] },
+    "Normalise Input": { "main": [[{ "node": "TheHive — Create Case", "type": "main", "index": 0 }]] },
+    "TheHive — Create Case": { "main": [[{ "node": "Parse Case ID", "type": "main", "index": 0 }]] },
+    "Parse Case ID": { "main": [[{ "node": "Has Observables?", "type": "main", "index": 0 }]] },
+    "Has Observables?": {
+      "main": [
+        [{ "node": "TheHive — Add Observable", "type": "main", "index": 0 }],
+        [{ "node": "Build Result", "type": "main", "index": 0 }]
+      ]
+    },
+    "TheHive — Add Observable": { "main": [[{ "node": "Build Result", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1", "binaryMode": "separate", "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true, "saveManualExecutions": true,
+    "saveDataErrorExecution": "all", "saveDataSuccessExecution": "all"
+  },
+  "versionId": "fed59e8b-dea3-4c2c-8659-9eb0222fc770",
+  "meta": { "instanceId": "c8a2709b949a2d6e46ab3c68e4e965bc396c0a55d9206e4fa8ee9927c92b07c8" },
+  "id": "wKPBXbyhvYMJ8qEH",
+  "tags": []
+}

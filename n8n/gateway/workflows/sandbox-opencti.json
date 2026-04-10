@@ -1,0 +1,141 @@
+{
+  "name": "[YAOC2 Sandbox] OpenCTI Sync",
+  "_fix": "Added full GraphQL query bodies to both OpenCTI nodes (were empty). Added error handling for GraphQL errors[] in response.",
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "wf-trigger",
+      "name": "Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst params = raw.parameters ?? {};\nconst stixBundle = params.stix_bundle ?? null;\nconst objectType = params.object_type ?? null;\nconst objectId = params.object_id ?? null;\nconst proposedActionId = raw.proposed_action_id ?? 'unknown';\nif (!stixBundle && !objectType) throw new Error('Sandbox: parameters.stix_bundle or parameters.object_type is required');\nreturn [{ json: { stix_bundle: stixBundle, object_type: objectType, object_id: objectId, proposed_action_id: proposedActionId, action: raw.action, requester: raw.requester } }];"
+      },
+      "id": "normalise-input",
+      "name": "Normalise Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.stix_bundle !== null }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "has-bundle" }]
+              },
+              "renameOutput": true, "outputKey": "bundle"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+                "combinator": "and",
+                "conditions": [{ "leftValue": "={{ $json.stix_bundle === null }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" }, "id": "no-bundle" }]
+              },
+              "renameOutput": true, "outputKey": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "input-route",
+      "name": "Bundle or Object?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [480, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCTI_URL }}/graphql",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.OPENCTI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: 'mutation StixBundleImport($content: String!) { stixBundleImport(content: $content) { id } }', variables: { content: JSON.stringify($json.stix_bundle) } }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "opencti-import-bundle",
+      "name": "OpenCTI — Import STIX Bundle",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, -128]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCTI_URL }}/graphql",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.OPENCTI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: 'query GetObject($id: String!) { stixObjectOrStixRelationship(id: $id) { ... on BasicObject { standard_id entity_type } ... on BasicRelationship { standard_id entity_type } } }', variables: { id: $json.object_id } }) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "opencti-get-object",
+      "name": "OpenCTI — Get Object",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 128]
+    },
+    {
+      "parameters": {
+        "jsCode": "const bundle = $input.item.json;\nconst input = $('Normalise Input').first().json;\nif (bundle.errors?.length) throw new Error('OpenCTI GraphQL error: ' + bundle.errors.map(e => e.message).join('; '));\nconst importId = bundle.data?.stixBundleImport?.id ?? null;\nconst success = !!importId;\nreturn [{ json: {\n  status: success ? 'success' : 'failed',\n  result_summary: success ? `STIX bundle imported to OpenCTI. Import ID: ${importId}` : 'STIX bundle import returned no ID — check OpenCTI logs.',\n  raw_result_ref: importId,\n  proposed_action_id: input.proposed_action_id\n} }];"
+      },
+      "id": "build-result-bundle",
+      "name": "Build Result (Bundle)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, -128]
+    },
+    {
+      "parameters": {
+        "jsCode": "const obj = $input.item.json;\nconst input = $('Normalise Input').first().json;\nif (obj.errors?.length) throw new Error('OpenCTI GraphQL error: ' + obj.errors.map(e => e.message).join('; '));\nconst found = obj.data?.stixObjectOrStixRelationship ?? null;\nconst success = !!found;\nreturn [{ json: {\n  status: success ? 'success' : 'partial',\n  result_summary: success ? `Object ${found.standard_id} (${found.entity_type}) found in OpenCTI.` : `Object ID ${input.object_id} not found in OpenCTI.`,\n  raw_result_ref: found?.standard_id ?? null,\n  proposed_action_id: input.proposed_action_id\n} }];"
+      },
+      "id": "build-result-object",
+      "name": "Build Result (Object)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 128]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Workflow Trigger": { "main": [[{ "node": "Normalise Input", "type": "main", "index": 0 }]] },
+    "Normalise Input": { "main": [[{ "node": "Bundle or Object?", "type": "main", "index": 0 }]] },
+    "Bundle or Object?": {
+      "main": [
+        [{ "node": "OpenCTI — Import STIX Bundle", "type": "main", "index": 0 }],
+        [{ "node": "OpenCTI — Get Object", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenCTI — Import STIX Bundle": { "main": [[{ "node": "Build Result (Bundle)", "type": "main", "index": 0 }]] },
+    "OpenCTI — Get Object": { "main": [[{ "node": "Build Result (Object)", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1", "binaryMode": "separate", "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true, "saveManualExecutions": true,
+    "saveDataErrorExecution": "all", "saveDataSuccessExecution": "all"
+  },
+  "versionId": "d5259dbc-af75-4d20-8b81-70ad7b41685f",
+  "meta": { "instanceId": "c8a2709b949a2d6e46ab3c68e4e965bc396c0a55d9206e4fa8ee9927c92b07c8" },
+  "id": "FFdEjxvVkqRIZQ7W",
+  "tags": []
+}

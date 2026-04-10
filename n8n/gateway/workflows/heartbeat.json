@@ -1,0 +1,223 @@
+{
+  "name": "YAOC2 Gateway Heartbeat",
+  "_version": "1.2.1",
+  "_fixes": [
+    "1: Update WhatsApp Webhook body rewritten as jsonBody expression (was broken mustache string)",
+    "2: Update WhatsApp Webhook now sends apikey header required by Evolution API v2",
+    "3: Update Telegram Webhook sendHeaders:true restored",
+    "4: Merge Webhook Results race eliminated — WA and TG now run sequentially, Merge removed",
+    "5: Bounce Receptionist Workflows uses $helpers.httpRequest (not helpers.httpRequest)",
+    "6: Flow is now linear: Schedule -> ngrok -> Extract -> WA -> TG -> List Brain -> Find IDs -> Bounce"
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0],
+      "id": "9e135bb8-7263-4030-b07b-548e4af453ab"
+    },
+    {
+      "parameters": {
+        "url": "http://ngrok:4040/api/tunnels",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "name": "Get ngrok Tunnel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [256, 0],
+      "id": "3c6d8e4c-789d-4e7c-b7dd-7ec5f3db823f"
+    },
+    {
+      "parameters": {
+        "jsCode": "const tunnels = $input.first().json.tunnels ?? [];\nconst tunnel = tunnels.find(t => t.proto === 'https') ?? tunnels[0];\nif (!tunnel) {\n  throw new Error('Heartbeat: no ngrok tunnel found. Is the ngrok sidecar running?');\n}\nconst url = tunnel.public_url;\nconsole.log('[Heartbeat] Detected ngrok URL:', url);\nreturn [{ json: { url } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "name": "Extract URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [512, 0],
+      "id": "501b652a-a171-4970-a487-5ea6c42e86e3"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.EVOLUTION_URL ?? 'http://evolution-api:8080') + '/webhook/set/' + ($env.EVOLUTION_INSTANCE_NAME ?? 'n8n claw') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.EVOLUTION_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.url + '/webhook/evolution', webhook_by_events: false, webhook_base64: false, events: ['MESSAGES_UPSERT', 'MESSAGES_UPDATE', 'CONNECTION_UPDATE', 'QRCODE_UPDATED', 'SEND_MESSAGE'] }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Update WhatsApp Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [768, 0],
+      "id": "f8af95b1-f998-414a-bd74-4413d8d5deae"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/setWebhook' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $('Extract URL').first().json.url + '/webhook/62b733ec-d504-4701-a675-16645871e72a', allowed_updates: ['message', 'callback_query'] }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Update Telegram Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1024, 0],
+      "id": "ae5a3be3-bbcf-42ab-8809-fa9d267ff52c"
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.BRAIN_N8N_URL ?? 'http://192.168.101.168:5678') + '/api/v1/workflows?active=true&limit=50' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-API-KEY",
+              "value": "={{ $env.BRAIN_N8N_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "List Brain Workflows",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1280, 0],
+      "id": "list-brain-workflows"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst workflows = data.data ?? [];\nconst RECEPTIONIST_NAMES = [\n  '[UNIFIED] Multi-Channel Router',\n  'YAOC2 Telegram Receptionist',\n  'YAOC2 WhatsApp Receptionist'\n];\nconst targets = workflows.filter(w =>\n  RECEPTIONIST_NAMES.some(name => w.name?.includes(name) || name.includes(w.name))\n);\nif (targets.length === 0) {\n  console.log('[Heartbeat] No receptionist workflows found on brain. Skipping bounce.');\n  return [{ json: { bounce_ids: [], skipped: true } }];\n}\nconsole.log('[Heartbeat] Bouncing:', targets.map(w => w.name + ' (' + w.id + ')').join(', '));\nreturn [{ json: { bounce_ids: targets.map(w => w.id), skipped: false } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "name": "Find Receptionist IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1536, 0],
+      "id": "find-receptionist-ids"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "not-skipped",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.skipped }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Should Bounce?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [1792, 0],
+      "id": "should-bounce"
+    },
+    {
+      "parameters": {
+        "jsCode": "const brainUrl = $env.BRAIN_N8N_URL ?? 'http://192.168.101.168:5678';\nconst apiKey = $env.BRAIN_N8N_API_KEY;\nif (!apiKey) throw new Error('Heartbeat: BRAIN_N8N_API_KEY not set');\nconst ids = $input.first().json.bounce_ids ?? [];\nconst results = [];\nfor (const id of ids) {\n  try {\n    await $helpers.httpRequest({\n      method: 'PATCH',\n      url: `${brainUrl}/api/v1/workflows/${id}`,\n      headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },\n      body: JSON.stringify({ active: false })\n    });\n    await new Promise(r => setTimeout(r, 800));\n    await $helpers.httpRequest({\n      method: 'PATCH',\n      url: `${brainUrl}/api/v1/workflows/${id}`,\n      headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },\n      body: JSON.stringify({ active: true })\n    });\n    results.push({ id, bounced: true });\n    console.log('[Heartbeat] Bounced workflow:', id);\n  } catch(e) {\n    results.push({ id, bounced: false, error: e.message });\n    console.warn('[Heartbeat] Failed to bounce workflow ' + id + ':', e.message);\n  }\n}\nreturn [{ json: { bounce_results: results, completed_at: new Date().toISOString() } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "name": "Bounce Receptionist Workflows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2048, 0],
+      "id": "bounce-receptionist-workflows"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{ "node": "Get ngrok Tunnel", "type": "main", "index": 0 }]]
+    },
+    "Get ngrok Tunnel": {
+      "main": [[{ "node": "Extract URL", "type": "main", "index": 0 }]]
+    },
+    "Extract URL": {
+      "main": [[{ "node": "Update WhatsApp Webhook", "type": "main", "index": 0 }]]
+    },
+    "Update WhatsApp Webhook": {
+      "main": [[{ "node": "Update Telegram Webhook", "type": "main", "index": 0 }]]
+    },
+    "Update Telegram Webhook": {
+      "main": [[{ "node": "List Brain Workflows", "type": "main", "index": 0 }]]
+    },
+    "List Brain Workflows": {
+      "main": [[{ "node": "Find Receptionist IDs", "type": "main", "index": 0 }]]
+    },
+    "Find Receptionist IDs": {
+      "main": [[{ "node": "Should Bounce?", "type": "main", "index": 0 }]]
+    },
+    "Should Bounce?": {
+      "main": [[{ "node": "Bounce Receptionist Workflows", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "a1b2c3d4-e5f6-4a7b-8c9d-heartbeat121",
+  "meta": {
+    "instanceId": "c8a2709b949a2d6e46ab3c68e4e965bc396c0a55d9206e4fa8ee9927c92b07c8"
+  },
+  "id": "vGhbAS9WDfPD40q7",
+  "tags": []
+}

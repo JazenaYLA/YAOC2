@@ -1,0 +1,75 @@
+{
+  "name": "YAOC2 WhatsApp Receptionist",
+  "_fix": "Body forwarding was empty (parameters:[{}]). Now uses specifyBody:json to forward full payload. Upgraded IF node to v2 filter syntax.",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp",
+        "options": {}
+      },
+      "id": "wa-trigger-id",
+      "name": "WhatsApp Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [112, 208],
+      "webhookId": "d2cf4a44-47b3-43a3-b3a3-dbc7fdf9b61e"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 },
+          "combinator": "and",
+          "conditions": [{
+            "id": "is-message-event",
+            "operator": { "type": "string", "operation": "equals" },
+            "leftValue": "={{ $json.body.event }}",
+            "rightValue": "messages.upsert"
+          }]
+        },
+        "options": {}
+      },
+      "id": "wa-if-id",
+      "name": "Is Message?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [352, 208]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n.lab.threatresearcher.net:5678/webhook/yaoc2-intelligence-v1",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{
+            "name": "X-Gateway-Secret",
+            "value": "={{ $env.GATEWAY_WEBHOOK_SECRET }}"
+          }, {
+            "name": "Content-Type",
+            "value": "application/json"
+          }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: 'whatsapp', raw: $input.first().json.body ?? $input.first().json }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "wa-forward-id",
+      "name": "Forward to Brain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [608, 208]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "WhatsApp Trigger": { "main": [[{ "node": "Is Message?", "type": "main", "index": 0 }]] },
+    "Is Message?": { "main": [[{ "node": "Forward to Brain", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": { "executionOrder": "v1", "binaryMode": "separate" },
+  "versionId": "a8a12668-3812-4e39-aa7e-492c15040070",
+  "meta": { "instanceId": "c8a2709b949a2d6e46ab3c68e4e965bc396c0a55d9206e4fa8ee9927c92b07c8" },
+  "id": "vWApAS9WDfPD40q6",
+  "tags": []
+}
