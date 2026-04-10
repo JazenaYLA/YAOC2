@@ -26,9 +26,23 @@ policy gateway in between.
 ## Architecture
 
 ```
-[User / Channel — Telegram, Discord, Web]
-        │
+[User / Channel — Telegram, WhatsApp, Discord, Web]
+        │  public HTTPS (via ngrok tunnel — see below)
         ▼
+┌────────────────────────────────────────────────────────┐
+│  lxc-dockge-cti  (existing)                            │
+│                                                        │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  yaoc2-gateway  Dockge stack  :5679              │  │
+│  │  n8n gateway + policy engine                    │  │
+│  │  ngrok sidecar  :4040  (temporary tunnel)       │  │
+│  │  audit log → infra-postgres (yaoc2 schema)      │  │
+│  └──────────────────────┬───────────────────────────┘  │
+│                         │  internal HTTP POST           │
+│                         │  X-Gateway-Secret             │
+└─────────────────────────┼──────────────────────────────┘
+                          │
+                          ▼
 ┌────────────────────────────────┐
 │  lxc-n8n  (existing)           │  systemd n8n  :5678
 │  YAOC2 Brain workflows         │  set up by n8n-ecosystem-unified
@@ -38,15 +52,7 @@ policy gateway in between.
                  ▼
 ┌────────────────────────────────────────────────────────┐
 │  lxc-dockge-cti  (existing)                            │
-│                                                        │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │  yaoc2-gateway  Dockge stack  :5679              │  │
-│  │  n8n gateway + policy engine                    │  │
-│  │  audit log → infra-postgres (yaoc2 schema)      │  │
-│  └──────────────────────┬───────────────────────────┘  │
-│                         │  validated, policy-approved   │
-│                         ▼                               │
-│  infra-postgres · infra-valkey · cti-net               │
+│  policy gateway validates → sandbox workflows execute  │
 │  misp · opencti · thehive · dfir-iris                  │
 │  xtm · shuffle · flowintel · lacus · ail               │
 └────────────────────────────────────────────────────────┘
@@ -72,7 +78,8 @@ Terminates all public webhooks. Authenticates, filters, and normalises traffic b
 Gateway workflows (`n8n/gateway/workflows/`):
 - `tg-receptionist.json` – Telegram Receptionist: Bot API webhook → internal HTTP POST with `X-Gateway-Secret`.
 - `wa-receptionist.json` – WhatsApp Receptionist: Evolution API `messages.upsert` → internal HTTP POST.
-- `heartbeat.json` – Polls `ngrok:4040`, updates Telegram/WhatsApp webhooks on tunnel restart, and works around n8n "Ghost 404" webhook deregistration issues.
+- `heartbeat.json` – Self-healing loop: polls ngrok, re-registers webhooks, bounces Brain receptionist
+  workflows to fix Ghost 404. See **ngrok & Tunnel Management** below.
 
 **2. Policy & Execution Layer (Gateway n8n)**
 
@@ -165,6 +172,82 @@ The Brain's agents call YAOC2-controlled CTI tools only via MCP:
 
 ---
 
+## ngrok & Tunnel Management
+
+> **ngrok is a YAOC2-only concern.** `n8n-ecosystem-unified` has no involvement with it.
+
+### Why ngrok exists here
+
+Telegram and WhatsApp require a **publicly reachable HTTPS URL** to deliver webhook events. In a
+homelab with a dynamic public IP and no static inbound port-forward, ngrok provides this as a Docker
+sidecar inside `yaoc2-gateway`. It is a **temporary workaround**, not a permanent component.
+
+### Current state: Heartbeat v1.2 (active)
+
+`heartbeat.json` runs every 5 minutes and performs three sequential jobs:
+
+**Job 1 — Tunnel URL extraction**
+Polls `http://ngrok:4040/api/tunnels`, extracts the current HTTPS `public_url`. Throws a non-silent
+error if no tunnel is found (alerts you that the ngrok sidecar has died).
+
+**Job 2 — Webhook re-registration**
+Re-registers both platform webhooks against the current URL in parallel:
+- WhatsApp: `PUT {EVOLUTION_URL}/webhook/set/{EVOLUTION_INSTANCE_NAME}` with events
+  `MESSAGES_UPSERT`, `MESSAGES_UPDATE`, `CONNECTION_UPDATE`.
+- Telegram: `POST https://api.telegram.org/bot{TOKEN}/setWebhook`.
+
+All values pulled from `$env` — no hardcoded URLs or tokens.
+
+**Job 3 — Ghost 404 bounce loop**
+
+n8n occasionally drops webhook registrations from its in-memory registry after a restart or
+hot-reload, returning `404 Not Registered` even when the workflow shows Active in the UI.
+
+To fix this autonomously, the Heartbeat:
+1. Calls `GET {BRAIN_N8N_URL}/api/v1/workflows?active=true` using `BRAIN_N8N_API_KEY`.
+2. Finds all active receptionist workflows by name (`[UNIFIED] Multi-Channel Router`,
+   `YAOC2 Telegram Receptionist`, `YAOC2 WhatsApp Receptionist`).
+3. For each: `PATCH /workflows/{id}` with `{ active: false }`, waits 800 ms, then
+   `PATCH /workflows/{id}` with `{ active: true }` — forcing n8n to rebind the webhook UUID.
+4. Errors per-workflow are non-fatal (logged, heartbeat continues).
+
+Required env vars for the Heartbeat:
+
+| Variable | Description |
+|---|---|
+| `EVOLUTION_URL` | Evolution API base URL (default: `http://evolution-api:8080`) |
+| `EVOLUTION_INSTANCE_NAME` | Evolution instance name |
+| `EVOLUTION_API_KEY` | Evolution API key |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot token |
+| `BRAIN_N8N_URL` | Brain n8n internal URL (default: `http://192.168.101.168:5678`) |
+| `BRAIN_N8N_API_KEY` | Brain n8n API key (Settings → API) |
+
+### Known limitations of ngrok free tier
+
+- URL changes on every tunnel restart (hence the Heartbeat).
+- Telegram enforces **one active webhook per bot** — if a second n8n instance (dev/test) calls
+  `setWebhook`, it overwrites the production registration. Use the Receptionist Pattern (single
+  canonical listener on the Gateway) to avoid this.
+- Free tier has request rate limits; consider ngrok paid or Cloudflare Tunnel if message volume grows.
+
+### Migration path (target state)
+
+The goal is to replace ngrok with a **stable tunnel** so the Heartbeat's webhook re-registration
+job becomes unnecessary (only the Ghost 404 bounce loop would remain):
+
+| Option | Notes |
+|---|---|
+| **Cloudflare Tunnel** (`cloudflared`) | Zero-trust, free, stable subdomain, drop-in sidecar replacement. Recommended. |
+| **Static port-forward + Caddy** | If ISP provides a static IP; add a Caddy route on the existing Caddy LXC. |
+| **Tailscale Funnel** | Good for dev; not recommended for production webhook throughput. |
+
+To migrate: replace the `ngrok` sidecar in `infra/dockge/yaoc2-gateway/docker-compose.yml` with
+`cloudflared`, set `TUNNEL_TOKEN` in the gateway `.env`, and update `TELEGRAM_BOT_TOKEN` /
+`EVOLUTION_URL` webhooks once with the new stable URL. The Heartbeat's Job 1 and Job 2 can then be
+disabled (set schedule to manual); Job 3 (Ghost 404 bounce) should remain active.
+
+---
+
 ## Repository Layout
 
 ```text
@@ -184,7 +267,7 @@ yaoc2/
       lxc-yaoc2-brain.conf.example   # reference only — brain reuses existing n8n LXC
     dockge/
       yaoc2-gateway/
-        docker-compose.yml           # drop into dockge-cti alongside other stacks
+        docker-compose.yml           # gateway n8n + ngrok sidecar (replace ngrok with cloudflared for prod)
         .env.example
     migrations/
       000_yaoc2_schema.sql           # run against infra-postgres
@@ -203,7 +286,7 @@ yaoc2/
         yaoc2-sandbox-thehive-case.json
         tg-receptionist.json
         wa-receptionist.json
-        heartbeat.json
+        heartbeat.json               # v1.2 — ngrok poll + webhook re-reg + Ghost 404 bounce
       code/
         validate-schema.js           # Code node — schema validation
         evaluate-policy.js           # Code node — policy evaluation
@@ -242,6 +325,7 @@ yaoc2/
 5. **Import brain workflows** — import `n8n/brain/workflows/yaoc2-brain-openclaw.json` into your existing n8n LXC.
 6. **Import gateway workflows** — import `n8n/gateway/workflows/*.json` into the gateway n8n instance.
 7. **Set credentials** — add MISP, OpenCTI, TheHive, Shuffle, Flowise, XTM, Telegram credentials in the gateway n8n.
+8. **Set env vars** — populate all `EVOLUTION_*`, `TELEGRAM_BOT_TOKEN`, `BRAIN_N8N_URL`, `BRAIN_N8N_API_KEY` in the gateway `.env` for the Heartbeat to work.
 
 See `docs/architecture.md` for the full walkthrough.
 
