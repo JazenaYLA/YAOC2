@@ -56,6 +56,115 @@ policy gateway in between.
 
 ---
 
+## Architecture Overview
+
+YAOC2 is a **policy-governed CTI bridge** that connects chat channels (Telegram, WhatsApp) and AI
+agents to internal threat-intel tooling (MISP, OpenCTI, TheHive, Cortex) via a hardened gateway.
+It assumes a separate AI platform repo (`n8n-ecosystem-unified`) that provides generic model routing
+and agent workflows.
+
+### Layered Design
+
+**1. Ingress & Edge Security (Gateway n8n)**
+
+Terminates all public webhooks. Authenticates, filters, and normalises traffic before it reaches the Brain.
+
+Gateway workflows (`n8n/gateway/workflows/`):
+- `tg-receptionist.json` – Telegram Receptionist: Bot API webhook → internal HTTP POST with `X-Gateway-Secret`.
+- `wa-receptionist.json` – WhatsApp Receptionist: Evolution API `messages.upsert` → internal HTTP POST.
+- `heartbeat.json` – Polls `ngrok:4040`, updates Telegram/WhatsApp webhooks on tunnel restart, and works around n8n "Ghost 404" webhook deregistration issues.
+
+**2. Policy & Execution Layer (Gateway n8n)**
+
+Enforces who can do what, where, and at which risk level. Maps high-level actions from the Brain into
+sandboxed CTI workflows.
+
+Gateway workflows (`n8n/gateway/workflows/`):
+- `policy-gateway.json` – Receives `ProposedAction` objects, validates schema, loads a policy set from
+  Postgres, evaluates rules, triggers human approval where required, and writes full audit records to
+  `yaoc2.audit_log`.
+- `sandbox-misp-enrich.json` – MISP attribute search → Cortex analyser → OpenCTI observable push.
+- `sandbox-opencti.json` – STIX bundle import / object lookup in OpenCTI.
+- `sandbox-thehive.json` – TheHive case creation with observables and tasks.
+
+**3. Reasoning Platform (Brain n8n — separate repo)**
+
+Lives in `n8n-ecosystem-unified` and runs on a separate n8n instance (LXC "Brain").
+
+Provides:
+- Multi-channel normalisation and response routing.
+- Tiered model router (Haiku / Sonnet / Opus) with shared memory and MCP tools.
+- Generic agents (e.g., Gmail Email Manager).
+
+The Brain only talks to YAOC2 via:
+- Internal HTTP from Receptionists using `X-Gateway-Secret`.
+- MCP tools exposed by the Gateway (for CTI sandboxes), authenticated with `Bearer $GATEWAY_MCP_TOKEN`.
+
+### Integration Contract
+
+**Gateway → Brain message envelope**
+
+Receptionists forward a normalised object:
+
+```json
+{
+  "userMessage": "string",
+  "chatId": "string",
+  "userId": "string",
+  "source": "telegram|whatsapp|discord|slack",
+  "metadata": {
+    "raw": { "...": "..." }
+  }
+}
+```
+
+**Brain → YAOC2 `ProposedAction`**
+
+When the Brain wants to perform a CTI action it submits a `ProposedAction` JSON to the Policy Gateway
+webhook. Minimum required fields:
+
+```json
+{
+  "id": "<uuid-v4>",
+  "timestamp": "<ISO8601>",
+  "agent": { "name": "tiered-model-router", "version": "1.1.0" },
+  "requester": {
+    "user_id": "string",
+    "channel": "telegram|whatsapp|web|api",
+    "tenant": "string",
+    "display_name": "string"
+  },
+  "intent": {
+    "title": "IOC enrichment",
+    "summary": "Enrich 1.1.1.1 in MISP and OpenCTI"
+  },
+  "action": {
+    "type": "workflow|http_call|shell|external_soar",
+    "name": "ioc_enrichment_misp_opencti",
+    "target_system": "yaoc2-sandbox",
+    "mode": "read-only|read-write|admin",
+    "parameters": { "...": "..." }
+  },
+  "risk": { "level": "low|medium|high|critical" },
+  "policy": { "policy_set": "default" },
+  "llm_explanation": "why this action was proposed"
+}
+```
+
+**YAOC2 → CTI Tools**
+
+Only YAOC2 sandbox workflows call MISP, OpenCTI, TheHive, etc. The Brain never talks to those
+systems directly.
+
+**Brain ↔ YAOC2 MCP tools**
+
+The Brain's agents call YAOC2-controlled CTI tools only via MCP:
+- MCP endpoint: `https://gateway.lab.threatresearcher.net/rest/mcp/sse`
+- Auth: `Authorization: Bearer {{ $env.GATEWAY_MCP_TOKEN }}` — store in `/opt/n8n.env` on the Brain LXC, rotate via Infisical.
+- MCP tools represent virtual actions (`misp_enrich`, `opencti_sync`, etc.); the actual implementations live as sandbox workflows in this repo.
+
+---
+
 ## Repository Layout
 
 ```text
@@ -92,6 +201,9 @@ yaoc2/
         yaoc2-sandbox-misp-enrich.json
         yaoc2-sandbox-opencti-sync.json
         yaoc2-sandbox-thehive-case.json
+        tg-receptionist.json
+        wa-receptionist.json
+        heartbeat.json
       code/
         validate-schema.js           # Code node — schema validation
         evaluate-policy.js           # Code node — policy evaluation
